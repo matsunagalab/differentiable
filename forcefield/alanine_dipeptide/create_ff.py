@@ -10,13 +10,10 @@ import sys
 args = sys.argv
 
 #path
-pdb_filepath = args[1]
-ff_input_filepath  = args[2]
-ff_output_xml_filepath = args[3]
-ff_output_txt_filepath = args[4]
-
-#parameter
-maximum_update_ratio = 0.03 #最大でffのパラメータをどの程度変えるか
+ff_input_filepath  = args[1]
+ff_output_xml_filepath = args[2]
+ff_output_txt_filepath = args[3]
+maximum_update_ratio = float(args[4]) #最大でffのパラメータをどの程度変えるか
 
 #atom_type
 phi_atom_type = [['C'], ['N'], ['CT'], ['C']]

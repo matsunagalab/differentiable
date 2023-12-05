@@ -7,4 +7,4 @@
 #SBATCH -w n4
 
 #python sim.py alanine-dipeptide-nowater.pdb GB99dms_new.xml traj_new
-python sim.py alanine-dipeptide-nowater.pdb GB99dms.xml traj_target 5000000
+python sim.py alanine-dipeptide-nowater.pdb GB99dms_target.xml traj_target 100000
