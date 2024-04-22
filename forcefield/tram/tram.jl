@@ -22,8 +22,7 @@ function tram(c_ijk, N_ik, b_kln, index_of_cluster_kn; tol=1e-10, max_iter=20)
             v_ik = tram_v_new_ik(c_ijk, v_ik, f_ik)
         end
         f_new_ik = tram_f_new_ik(f_ik, R_ik, b_kln, N_ik, index_of_cluster_kn)
-        #f_new_ik = tram_f_new_ik1(f_ik, R_ik, b_kln, N_ik, index_of_cluster_kn)
-    
+
         max_dif = maximum(f_ik .- f_new_ik)
         println("iteration = $(i), delta = $(max_dif)")
         if(max_dif < tol)
@@ -89,22 +88,6 @@ end
 
 # f^k,newの計算では、Σ_(x∈X_i)があるため、index_of_cluster_knを用いる
 # b_klnはkアンサンブルをl番目のポテンシャルで評価したもの
-
-
-function tram_f_new_ik1(f_ik, R_ik, b_kln, N_ik, index_of_cluster_kn)
-    m, K = size(N_ik)
-    f_new_ik = zeros(Float64, m, K)
-
-    log_w_ikn = tram_log_w_ikn(f_ik, R_ik, b_kln, N_ik, index_of_cluster_kn)
-    for k in 1:K
-        for i in 1:m
-            f_new_ik[i, k] = - MDToolbox.logsumexp(log_w_ikn[i, k, :])
-        end
-    end
-    f_new_ik = normalize_f_ik(f_new_ik)
-    return f_new_ik
-end
-
 
 function tram_f_new_ik(f_ik, R_ik, b_kln, N_ik, index_of_cluster_kn)
     m, K = size(N_ik)
