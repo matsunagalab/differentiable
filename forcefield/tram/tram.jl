@@ -45,6 +45,37 @@ function tram(c_ijk, N_ik, N_k, b_kln, index_of_cluster_kn; tol=1e-10, max_iter=
     return f_ik, v_ik, R_ik
 end
 
+# 複数の返り値を持つ関数のrruleの書き方が分からないため、適当な関数を用意する
+function tram_f(f_ik, R_ik, b_kln, N_ik, N_k, index_of_cluster_kn)
+    return f_ik
+end
+
+function ChainRulesCore.rrule(::typeof(tram_f), f_ik, R_ik, b_kln, N_ik, N_k, index_of_cluster_kn)
+    m, K = size(f_ik)
+    f_ik = tram(f_ik, b_kln)
+    function tram_f_pullback(df)
+        db_kln = similar(b_kln)
+        w_ik = Array{Array{Float64}}(undef, m, K)
+        for k in 1:K
+            for i in 1:m
+                log_wik_jn = tram_log_wik_jn(f_ik, R_ik, b_kln, N_k, i, k)
+                w_ik[i, k] = exp.(log_wik_jn)
+            end
+        end
+        for k in 1:K
+            for l in 1:K
+                for n in 1:N_k[k]
+                    istate = index_of_cluster_kn[k, n]
+                    db_kln[k, l, n] = - w_ik[istate, k][l, n] / f_ik[i, k] * df[i, k]
+                end
+            end
+        end
+        return NoTangent(), NoTangent(), NoTangent(), db_kln, NoTangent(), NoTangent(), NoTangent()
+    end
+
+    return f_ik, tram_f_pullback
+end
+
 function tram_by_delta(c_ijk, N_ik, N_k, b_kln, index_of_cluster_kn; tol=1e-10, max_iter=10000)
     f_ik, v_ik, R_ik = tram_init(c_ijk, N_ik)
 
@@ -111,6 +142,24 @@ function tram_p_ijk(c_ijk, v_ik, f_ik)
         end
     end
     return p_ijk
+end
+
+function ChainRulesCore.rrule(::typeof(tram_p_ijk), c_ijk, v_ik, f_ik)
+    m, K = size(f_ik)
+    p_ijk = tram_p_ijk(c_ijk, v_ik, f_ik)
+
+    function tram_p_ijk_pullback(dp)
+        df_ik = similar(f_ik)
+        for k in 1:K
+            for i in 1:m
+                for j in 1:m
+                    df_ik[i, k] += p_ijk[i, j, k] * (1 - v_ik[i, k] / (exp(f_ik[j, k] - f_ik[i, k]) * v_ik[j, k] + v_ik[i, k])) * dp[i, j, k]
+                end
+            end
+        end
+        return NoTangent(), NoTangent(), NoTangent(), df_ik
+    end
+    return p_ijk, tram_p_ijk_pullback
 end
 
 function tram_R_ik(c_ijk, v_ik, f_ik, N_ik)
