@@ -51,7 +51,10 @@ system = forcefield.createSystem(
 )
 
 integrator = LangevinMiddleIntegrator(temperature, friction, dt * picoseconds)
-simulation = Simulation(pdb.topology, system, integrator)
+simulation = Simulation(pdb.topology, system, integrator, platform, platformProperties)
+
+platform = mm.openmm.Platform.getPlatformByName('CUDA')
+platformProperties = {'Precision': 'mixed'}
 
 if os.path.isfile(checkpoint_fp):
     print("Restarting from checkpoint")
@@ -85,7 +88,7 @@ else:
     system_equil.addForce(pos_res)
     integrator_equil = LangevinMiddleIntegrator(temperature, friction, dt * picoseconds)
 
-    equilibration = Simulation(pdb.topology, system_equil, integrator_equil)
+    equilibration = Simulation(pdb.topology, system_equil, integrator_equil, platform, platformProperties)
     equilibration.context.setPositions(pdb.positions)
     equilibration.minimizeEnergy()
 
