@@ -51,11 +51,11 @@ system = forcefield.createSystem(
     implicitSolventKappa=kappa,
 )
 
-integrator = LangevinMiddleIntegrator(temperature, friction, dt * picoseconds)
-simulation = Simulation(pdb.topology, system, integrator, platform, platformProperties)
-
 platform = mm.Platform.getPlatformByName('CPU')
 platformProperties = {'Precision': 'double'}
+
+integrator = LangevinMiddleIntegrator(temperature, friction, dt * picoseconds)
+simulation = Simulation(pdb.topology, system, integrator, platform, platformProperties)
 
 if os.path.isfile(checkpoint_fp):
     print("Restarting from checkpoint")
