@@ -5,6 +5,7 @@
 
 #陰溶媒の半径を考える（いつか）
 
+import openmm as mm
 from openmm.app import *
 from openmm import *
 from openmm.unit import *
@@ -53,8 +54,8 @@ system = forcefield.createSystem(
 integrator = LangevinMiddleIntegrator(temperature, friction, dt * picoseconds)
 simulation = Simulation(pdb.topology, system, integrator, platform, platformProperties)
 
-platform = mm.openmm.Platform.getPlatformByName('CUDA')
-platformProperties = {'Precision': 'mixed'}
+platform = mm.Platform.getPlatformByName('CPU')
+platformProperties = {'Precision': 'double'}
 
 if os.path.isfile(checkpoint_fp):
     print("Restarting from checkpoint")
