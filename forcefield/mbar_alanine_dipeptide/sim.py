@@ -23,13 +23,14 @@ if len(sys.argv) > 5 and sys.argv[5] == "CutoffPeriodic":
 else:
     nonbondedMethod = CutoffNonPeriodic
 
-dt = 0.001 # ps
+dt = 0.004 # ps
 #n_steps       = int(ceil(2e6 / dt)) # 2 μs
-n_steps         = int(ceil(int(n_steps_str) / dt))
+n_steps         = int(ceil(int(n_steps_str)))
 #n_steps_equil = int(ceil(500 / dt)) # 500 ps
 n_steps_equil = int(ceil(1 / dt)) # 1 ps
 #n_steps_save  = int(ceil(500 / dt)) # 500 ps
-n_steps_save  = int(ceil(1 / dt)) # 1 ps
+#n_steps_save  = int(ceil(1 / dt)) # 1 ps
+n_steps_save = int(ceil(1 / dt)) # 0.1 ps
 temperature = 300.0 * kelvin
 kappa = 0.7 / nanometer
 friction = 1 / picosecond
@@ -51,7 +52,8 @@ system = forcefield.createSystem(
     implicitSolventKappa=kappa,
 )
 
-platform = mm.Platform.getPlatformByName('CPU')
+#platform = mm.Platform.getPlatformByName('CPU')
+platform = mm.Platform.getPlatformByName('CUDA')
 platformProperties = {'Precision': 'double'}
 
 integrator = LangevinMiddleIntegrator(temperature, friction, dt * picoseconds)
