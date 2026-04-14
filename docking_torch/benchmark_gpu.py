@@ -156,6 +156,45 @@ def main():
             g_fwd, g_fb = results[("cuda", F)]
             print(f"{F:>5}  {c_fwd/g_fwd:>7.2f}x  {c_fb/g_fb:>9.2f}x")
 
+        check_cpu_vs_cuda(F=Fs[0])
+
+
+def check_cpu_vs_cuda(F=10, rtol=1e-3, atol=1e-2):
+    """Verify CPU(float64) and CUDA(float32) produce the same forward scores
+    and backward gradients on the same inputs. Tolerances reflect the
+    float64 vs float32 precision gap."""
+    print("\nnumerical agreement — CPU(float64) vs CUDA(float32)")
+    print(f"F={F}, rtol={rtol}, atol={atol}")
+
+    def _run(device_name):
+        device = torch.device(device_name)
+        dtype = torch.float64 if device.type == "cpu" else torch.float32
+        inp = _prepare(device, dtype, F)
+        params = ("alpha", "iface_ij_flat", "beta", "charge_score")
+        scores = docking_score_elec(**inp)
+        scores.sum().backward()
+        out = {"scores": scores.detach().cpu().double()}
+        for p in params:
+            out[f"grad_{p}"] = inp[p].grad.detach().cpu().double()
+        return out
+
+    cpu = _run("cpu")
+    gpu = _run("cuda")
+
+    all_ok = True
+    print(f"  {'quantity':<22}{'max abs err':>14}{'max rel err':>14}  status")
+    for k in cpu:
+        a, b = cpu[k], gpu[k]
+        abs_err = (a - b).abs().max().item()
+        denom = a.abs().clamp_min(1e-30)
+        rel_err = ((a - b).abs() / denom).max().item()
+        ok = abs_err <= atol + rtol * a.abs().max().item()
+        all_ok = all_ok and ok
+        print(f"  {k:<22}{abs_err:>14.3e}{rel_err:>14.3e}  {'OK' if ok else 'FAIL'}")
+
+    print("\nresult:", "all close within tolerance" if all_ok else "MISMATCH")
+    return all_ok
+
 
 if __name__ == "__main__":
     main()
