@@ -205,6 +205,29 @@ def set_radius(
     return torch.tensor(radii, device=device, dtype=dtype)
 
 
+def partial_charge_per_atom(
+    charge_ids: torch.Tensor,
+    charge_score_lut: torch.Tensor,
+) -> torch.Tensor:
+    """Resolve per-atom partial charges from the 11-entry charge-type LUT.
+
+    Intermediate helper used by the Coulombic ELEC path (score.py). Given a
+    vector of 1-based charge IDs as produced by `set_charge()` and a
+    `charge_score_lut` of shape (11,) such as `get_charge_score()` returns,
+    produce a (N,) float tensor of partial charges per atom.
+
+    IDs outside [1, 11] get 0.0 (no charge). This is a stopgap for the full
+    CHARMM19 per-atom partial-charge LUT — see PORT_PLAN.md B14.
+    """
+    if charge_score_lut.shape != (11,):
+        raise ValueError(f"expected charge_score_lut of shape (11,), got {tuple(charge_score_lut.shape)}")
+    idx = (charge_ids - 1).clamp(0, 10).to(torch.long)
+    out = charge_score_lut[idx]
+    # Zero out atoms whose charge_id fell outside 1..11
+    valid = (charge_ids >= 1) & (charge_ids <= 11)
+    return torch.where(valid, out, torch.zeros_like(out))
+
+
 def set_charge(
     resnames: Iterable[str],
     atomnames: Iterable[str],

@@ -35,6 +35,9 @@ where = ["src"]
 [tool.pytest.ini_options]
 testpaths = ["tests"]
 filterwarnings = ["error"]
+# Exclude `slow` tests by default (training/benchmark runs). Enable with
+# `uv run pytest -m slow` for the 200-epoch convergence test.
+addopts = ["-m", "not slow"]
 markers = [
     "slow: long-running training / benchmark tests (opt-in with -m slow)",
 ]

@@ -103,6 +103,66 @@ grid[ix, iy, iz] += weight[iatom] / sqrt(d)
 - **B3 修正**：`set_charge` の `ta.resname[iatom] == "O"/"OXT"` を `atomname[iatom] == "O"/"OXT"` に
 - **B4 判定**：ユーザと相談。修論記述（3.5 節：`Σ q / r`）と現コード（`Σq / Σr`）のどちらを正とするか
 
+## Phase C: Literature-driven ELEC fixes (B10–B15)
+
+論文精読（Chen & Weng 2002, Chen et al. 2003, Mintseris et al. 2007）で
+判明した ELEC 実装の根本的な問題。B4 は単なる判断ではなく明確なバグと
+確定。ユーザ指示で Julia・PyTorch 両側を修正。
+
+### B10. ELEC が Coulomb でない (Σq/Σr pseudo-quantity)
+
+- **Chen 2002 p284 明記**: "The electrostatics energy... described by the
+  **Coulombic formula**. We adopted the approach by Gabb et al., except
+  that we used the partial charges in the CHARMM19 potential."
+- **修正**: `V(r) = Σⱼ qⱼ / |r − rⱼ|` を直接計算。
+  - Julia: `docking_score_elec_coulomb`（`docking_canonical.jl`）
+  - Python: `docking_score_elec(..., elec_mode="coulomb")`（デフォルト）
+
+### B11. リガンド側電荷の符号抜け
+
+- **Chen 2003 Eq 2**: `Im[L_PSC+DE+ELEC] = -1 × atom_charge` at nearest cell.
+- **修正**: Coulombic path で自然に組み込む（`Σ V_rec × q_lig` の符号が
+  相互作用エネルギーになる）。
+
+### B12. ELEC を同原子タイプペアに限定していた
+
+- **Chen 2002**: "all atom pairs" で Coulomb 和を取る。
+- **現実装の間違い**: `for l in 1:11` で `ligands.atomtype_id == l` かつ
+  `receptor.atomtype_id == l` のペアにのみ限定。LYS-NZ × ASP-OD のような
+  **強い異種イオン引力が完全に欠落**していた。
+- **修正**: Coulombic path はタイプでグループ化しない（全ペア和）。
+
+### B13. 受容体コア内で V=0 処理がない
+
+- **Chen 2002 p284 明記**: "grid points in the core of the receptor are
+  assigned a value of 0 for the electric potential, to avoid contributions
+  from non-physical receptor-core/ligand contacts."
+- **修正**: `V_rec = V_rec * open_space_mask` で SC shape 内をゼロ化。
+
+### B14. 電荷 LUT が粗すぎる (軽微)
+
+- **論文**: CHARMM19 per-atom partial charges (≥20 残基 × 10+ 原子 = 100+ 値)。
+- **現実装**: 11 値のみ（TERM-N, TERM-O, ARG-NH, GLU-OE, ASP-OD, LYS-NZ,
+  PRO-N, 他ゼロ）。
+- **一次対応**: `partial_charge_per_atom(charge_id, charge_score)` で
+  軽量版 per-atom 電荷を生成。本格 CHARMM19 移植は後続課題。
+
+### B15. ELEC 距離カットオフ (軽微)
+
+論文は "all receptor atoms" だが、実装は rcut=8Å。実用上容認、文書化済み。
+
+### 検証
+
+`docking_torch/tests/test_physics.py` で 5 テスト全緑：
+- 符号（正電荷ペアで斥力、異符号で引力）
+- 1/r スケーリング（float64 rel_err 0）
+- 重ね合わせ原理 (|V_A + V_B − V_AB| = 0)
+- Coulomb vs legacy が実データで異なる (1KXQ Δ ~3.9)
+- autograd が Coulomb パスを通過する
+
+Julia と PyTorch の Coulomb 実装は 1KXQ 10 ポーズで **max rel err 0.00**
+（bit-exact）。
+
 ### A-3. スコア妥当性チェック
 
 1KXQ で B1 修正前後の以下を比較：

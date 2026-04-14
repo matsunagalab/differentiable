@@ -297,8 +297,9 @@ function xyz_matrix(ta)
     return out
 end
 
-scores_dse = docking_score_elec(receptor, ligands, ALPHA, iface_flat, BETA, charge_arr)
-scores_ds  = docking_score(receptor, ligands, ALPHA, iface_flat)
+scores_dse         = docking_score_elec(receptor, ligands, ALPHA, iface_flat, BETA, charge_arr)
+scores_dse_coulomb = docking_score_elec_coulomb(receptor, ligands, ALPHA, iface_flat, BETA, charge_arr)
+scores_ds          = docking_score(receptor, ligands, ALPHA, iface_flat)
 
 writeh5(joinpath(REF_ROOT, "phase5_scores.h5"),
     Dict(
@@ -320,9 +321,11 @@ writeh5(joinpath(REF_ROOT, "phase5_scores.h5"),
         "lig_sasa"         => Array{Float64}(lig_prep.sasa),
         "lig_atomtype_id"  => Array{Int64}(lig_prep.atomtype_id),
         "lig_charge_id"    => Array{Int64}(lig_prep.charge),
-        # outputs
+        # outputs — legacy Σq/Σr ELEC (pre-B10-fix, for reproduction)
         "score_elec_total" => Array{Float64}(scores_dse),
         "score_noelec"     => Array{Float64}(scores_ds),
+        # outputs — Coulombic ELEC (B10/B11/B12/B13 fixed, physically correct)
+        "score_coulomb_total" => Array{Float64}(scores_dse_coulomb),
     ))
 
 println(">>> All references written to $(REF_ROOT)")

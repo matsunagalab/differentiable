@@ -40,14 +40,20 @@ import math
 
 import torch
 
+from typing import Literal
+
 from .geom import generate_grid, orient
-from .atomtypes import iface_ij
+from .atomtypes import iface_ij, partial_charge_per_atom
 from .spread import (
     _neighbors_indices,
     _flat_index,
     _in_bounds,
     _nearest_cell_indices,
+    spread_neighbors_coulomb,
 )
+
+
+ElecMode = Literal["coulomb", "legacy"]
 
 
 # ---------------------------------------------------------------------------
@@ -146,17 +152,20 @@ def _assign_sc_plus(
     weight_s = torch.ones_like(radius[surf])
     weight_c = torch.ones_like(radius[core])
 
-    if receptor:
+    if surf.any():
+        if receptor:
+            spread_neighbors_substitute(
+                grid, xyz[surf], weight_s, radius[surf] + 3.4, x_grid, y_grid, z_grid
+            )
         spread_neighbors_substitute(
-            grid, xyz[surf], weight_s, radius[surf] + 3.4, x_grid, y_grid, z_grid
+            grid, xyz[surf], weight_s,
+            radius[surf] * math.sqrt(0.8) if receptor else radius[surf],
+            x_grid, y_grid, z_grid,
         )
-    spread_neighbors_substitute(
-        grid, xyz[surf], weight_s, radius[surf] * math.sqrt(0.8) if receptor else radius[surf],
-        x_grid, y_grid, z_grid,
-    )
-    spread_neighbors_substitute(
-        grid, xyz[core], weight_c, radius[core] * math.sqrt(1.5), x_grid, y_grid, z_grid
-    )
+    if core.any():
+        spread_neighbors_substitute(
+            grid, xyz[core], weight_c, radius[core] * math.sqrt(1.5), x_grid, y_grid, z_grid
+        )
     return grid
 
 
@@ -175,23 +184,24 @@ def _assign_sc_minus(
     surf = id_surface
     core = ~id_surface
 
-    if receptor:
-        weight_s_1 = torch.full_like(radius[surf], 3.5)
+    if surf.any():
+        if receptor:
+            weight_s_1 = torch.full_like(radius[surf], 3.5)
+            spread_neighbors_substitute(
+                grid, xyz[surf], weight_s_1, radius[surf] + 3.4, x_grid, y_grid, z_grid
+            )
+        weight_s_2 = torch.full_like(radius[surf], 12.25)
         spread_neighbors_substitute(
-            grid, xyz[surf], weight_s_1, radius[surf] + 3.4, x_grid, y_grid, z_grid
+            grid, xyz[surf], weight_s_2,
+            radius[surf] * math.sqrt(0.8) if receptor else radius[surf],
+            x_grid, y_grid, z_grid,
         )
 
-    weight_s_2 = torch.full_like(radius[surf], 12.25)
-    spread_neighbors_substitute(
-        grid, xyz[surf], weight_s_2,
-        radius[surf] * math.sqrt(0.8) if receptor else radius[surf],
-        x_grid, y_grid, z_grid,
-    )
-
-    weight_c = torch.full_like(radius[core], 12.25)
-    spread_neighbors_substitute(
-        grid, xyz[core], weight_c, radius[core] * math.sqrt(1.5), x_grid, y_grid, z_grid
-    )
+    if core.any():
+        weight_c = torch.full_like(radius[core], 12.25)
+        spread_neighbors_substitute(
+            grid, xyz[core], weight_c, radius[core] * math.sqrt(1.5), x_grid, y_grid, z_grid
+        )
     return grid
 
 
@@ -221,12 +231,22 @@ def docking_score_elec(
     rcut_iface: float = 6.0,
     rcut_elec: float = 8.0,
     surface_threshold: float = 1.0,
+    elec_mode: ElecMode = "coulomb",
 ) -> torch.Tensor:
     """Return a (F,) tensor of docking scores.
 
-    Mirrors `docking_score_elec` (notebook cell 4) with B1 (safe-divide in
-    receptor potential) and B3/B8 fixes applied. Fully batched over atom
-    types for GPU efficiency.
+    Default `elec_mode="coulomb"` implements the physically-correct Chen 2002 /
+    Chen 2003 ELEC: receptor generates a Coulombic potential V(r) = Σⱼ qⱼ / |r−rⱼ|
+    (zeroed inside the receptor SC shape), ligand stores -q at the nearest grid
+    cell of each atom, and `score_elec` accumulates V × (-q) ≡ Coulomb energy
+    across all (lig-atom × rec-atom) pairs. β scales this sum in `score_total`.
+
+    `elec_mode="legacy"` preserves the notebook's original (buggy) formulation
+    that groups ELEC by atom-type and computes `Σq / Σr` instead of Σq/r. This
+    matches the Julia reference before the B10/B11/B12/B13 fixes and exists for
+    bit-exact reproduction of the master thesis numbers.
+
+    SC + IFACE are unchanged between modes (they have no ELEC-specific bugs).
     """
     device = rec_xyz.device
     dtype = rec_xyz.dtype
@@ -273,33 +293,46 @@ def docking_score_elec(
         x_grid, y_grid, z_grid,
     )
 
-    # Precompute receptor ELEC potential slabs U[l] for l in 1..11
-    # (B1 fix: safe divide). NOTE: Julia's `docking_score_elec` groups
-    # atoms for ELEC by **atomtype_id** (IFACE 12-way classification),
-    # NOT by charge_id (chemical 11-way). See notebook cell 4 lines
-    # 769-778 — `idx = ligands.atomtype_id .== l` with l in 1..11 means
-    # atoms of atomtype_id 12 are SKIPPED for ELEC and charge_score[l]
-    # is indexed by atomtype_id (not chemical charge class). Preserve
-    # this (possibly-unintended) behaviour so gradients match Julia FD.
-    rec_in_charge = (rec_atomtype_id >= 1) & (rec_atomtype_id <= 11)
-    rec_group_charge = torch.where(
-        rec_in_charge, rec_atomtype_id - 1, torch.full_like(rec_atomtype_id, -1)
-    ).to(torch.long)
-    rec_xyz_c = rec_xyz[rec_in_charge]
-    rec_group_c = rec_group_charge[rec_in_charge]
-    U_num = torch.zeros((11, nx, ny, nz), device=device, dtype=dtype)
-    U_den = torch.zeros((11, nx, ny, nz), device=device, dtype=dtype)
-    _grouped_spread_nearest_add(
-        U_num, rec_xyz_c, rec_group_c,
-        torch.ones(rec_xyz_c.shape[0], device=device, dtype=dtype),
-        x_grid, y_grid, z_grid,
-    )
-    _grouped_calculate_distance(
-        U_den, rec_xyz_c, rec_group_c, rcut_elec,
-        x_grid, y_grid, z_grid,
-    )
-    eps = torch.finfo(dtype).eps
-    U = torch.where(U_den > 0, U_num / U_den.clamp(min=eps), torch.zeros_like(U_num))
+    # --- Receptor ELEC (mode-dependent) ---------------------------------
+
+    if elec_mode == "coulomb":
+        # Chen 2002 p284: V(r) = Σⱼ qⱼ / |r − rⱼ|. Zero out cells that fall
+        # inside the receptor SC shape (Chen 2002 p284: "grid points in the
+        # core of the receptor are assigned a value of 0 for the electric
+        # potential"). `rec_sc_real > 0` covers both surface shell and core
+        # per the SC encoding, so V_rec is populated only in open space.
+        rec_partial_q = partial_charge_per_atom(rec_charge_id, charge_score)
+        V_rec = torch.zeros((nx, ny, nz), device=device, dtype=dtype)
+        spread_neighbors_coulomb(
+            V_rec, rec_xyz, rec_partial_q, rcut_elec,
+            x_grid, y_grid, z_grid,
+        )
+        open_space_mask = (rec_sc_real == 0) & (rec_sc_imag == 0)
+        V_rec = V_rec * open_space_mask.to(dtype)
+    else:  # elec_mode == "legacy"
+        # Original notebook behaviour: group by atomtype_id (B9), compute
+        # per-type `count / Σ√d` pseudo-potential (B10). Preserved for
+        # reproducing thesis numbers bit-for-bit against the original Julia
+        # reference.
+        rec_in_charge = (rec_atomtype_id >= 1) & (rec_atomtype_id <= 11)
+        rec_group_charge = torch.where(
+            rec_in_charge, rec_atomtype_id - 1, torch.full_like(rec_atomtype_id, -1)
+        ).to(torch.long)
+        rec_xyz_c = rec_xyz[rec_in_charge]
+        rec_group_c = rec_group_charge[rec_in_charge]
+        U_num = torch.zeros((11, nx, ny, nz), device=device, dtype=dtype)
+        U_den = torch.zeros((11, nx, ny, nz), device=device, dtype=dtype)
+        _grouped_spread_nearest_add(
+            U_num, rec_xyz_c, rec_group_c,
+            torch.ones(rec_xyz_c.shape[0], device=device, dtype=dtype),
+            x_grid, y_grid, z_grid,
+        )
+        _grouped_calculate_distance(
+            U_den, rec_xyz_c, rec_group_c, rcut_elec,
+            x_grid, y_grid, z_grid,
+        )
+        eps = torch.finfo(dtype).eps
+        U = torch.where(U_den > 0, U_num / U_den.clamp(min=eps), torch.zeros_like(U_num))
 
     # Frame-batched scoring. The loop over frames in the Julia code is the
     # single largest source of GPU kernel launch overhead; we vectorize it
@@ -413,19 +446,45 @@ def docking_score_elec(
     T = torch.einsum("fiv,jv->fij", L.reshape(F, 12, V), H.reshape(12, V))
     score_iface = (iface_matrix.unsqueeze(0) * T).reshape(F, -1).sum(-1)
 
-    # --- ELEC: batched V_grid[F, 11, V] ---------------------------------
-    valid_flat = lig_group_charge_flat >= 0
-    grp_f11 = frame_idx_per_atom * 11 + lig_group_charge_flat.clamp(min=0)
-    grp_f11 = grp_f11[valid_flat]
-    xyz_c_flat = lxyz_flat[valid_flat]
-    V_count = torch.zeros((F * 11, nx, ny, nz), device=device, dtype=dtype)
-    _grouped_spread_nearest_add(
-        V_count, xyz_c_flat, grp_f11,
-        torch.ones(xyz_c_flat.shape[0], device=device, dtype=dtype),
-        x_grid, y_grid, z_grid,
-    )
-    V_grid = V_count.view(F, 11, nx, ny, nz)
-    c = (V_grid.reshape(F, 11, V) * U.reshape(11, V).unsqueeze(0)).sum(-1)  # (F, 11)
-    score_elec = (charge_score.pow(2).unsqueeze(0) * c).sum(-1)
+    # --- ELEC (mode-dependent forward) ----------------------------------
+
+    if elec_mode == "coulomb":
+        # Per-frame ligand charge grid Q_L: scatter +q_lig_atom at the
+        # nearest cell. The paper's Im[L] = -q is absorbed into the final
+        # sign below so that `score_elec` returns the Coulomb interaction
+        # energy ΣΣ qᵢqⱼ / rᵢⱼ (negative for favorable, positive for
+        # clashing). `score_total` then uses `+ β × score_elec` as in the
+        # training notebook.
+        lig_partial_q = partial_charge_per_atom(lig_charge_id, charge_score)
+        lig_partial_q_flat = lig_partial_q.unsqueeze(0).expand(F, -1).reshape(-1)
+        Q_L_flat = torch.zeros(F * nx * ny * nz, device=device, dtype=dtype)
+        # frame_idx_per_atom already offsets by (nx*ny*nz) per frame when
+        # we pack (frame * nx*ny*nz + cell) — reuse _grouped_spread_nearest_add
+        # semantics by treating "frame" as the group.
+        _grouped_spread_nearest_add(
+            Q_L_flat.view(F, nx, ny, nz),
+            lxyz_flat, frame_idx_per_atom, lig_partial_q_flat,
+            x_grid, y_grid, z_grid,
+        )
+        Q_L = Q_L_flat.view(F, nx, ny, nz)
+        # Coulomb interaction energy per frame:
+        #   score_elec[f] = Σ_cells V_rec(cell) × Q_L[f, cell]
+        #               = Σ_lig_atom q_lig × V_rec(r_lig_atom)
+        #               = ΣΣ_ij q_i q_j / r_ij
+        score_elec = (V_rec.unsqueeze(0) * Q_L).reshape(F, -1).sum(-1)
+    else:  # elec_mode == "legacy"
+        valid_flat = lig_group_charge_flat >= 0
+        grp_f11 = frame_idx_per_atom * 11 + lig_group_charge_flat.clamp(min=0)
+        grp_f11 = grp_f11[valid_flat]
+        xyz_c_flat = lxyz_flat[valid_flat]
+        V_count = torch.zeros((F * 11, nx, ny, nz), device=device, dtype=dtype)
+        _grouped_spread_nearest_add(
+            V_count, xyz_c_flat, grp_f11,
+            torch.ones(xyz_c_flat.shape[0], device=device, dtype=dtype),
+            x_grid, y_grid, z_grid,
+        )
+        V_grid = V_count.view(F, 11, nx, ny, nz)
+        c = (V_grid.reshape(F, 11, V) * U.reshape(11, V).unsqueeze(0)).sum(-1)  # (F, 11)
+        score_elec = (charge_score.pow(2).unsqueeze(0) * c).sum(-1)
 
     return alpha * score_sc + score_iface + beta * score_elec

@@ -11,9 +11,12 @@ for the full list.
 - **Pure PyTorch** — NumPy and h5py are only for reference I/O
 - **Same code runs on macOS (MPS) and Linux (CUDA)** out of the box
 - Numerical agreement with the Julia reference is guaranteed by pytest
-  (all 24 tests green on CPU + MPS)
+  (all 28 tests green on CPU + MPS; training and physics tests included)
 - PyTorch autograd replaces the buggy hand-written `rrule` in Julia
 - Per-frame work is fused into a single einsum for GPU-friendly batching
+- **Physically correct Coulombic electrostatics** by default
+  (Chen 2002/2003 formulation), with a `legacy` mode for bit-exact
+  thesis reproduction — see below
 
 ## Quick start
 
@@ -113,12 +116,32 @@ scores = docking_score_elec(
     iface_ij_flat=iface_ij(device=device, dtype=dtype, flat=True),
     beta=torch.tensor(3.0, device=device, dtype=dtype),
     charge_score=charge_score(device=device, dtype=dtype),
+    elec_mode="coulomb",   # default; "legacy" for thesis reproduction
 )
 # scores: (F,) docking score per pose
 ```
 
 F is the number of poses evaluated together; the frame dimension is
 batched through einsum.
+
+#### `elec_mode` — electrostatics model selection
+
+- **`"coulomb"`** (default, physically correct per Chen 2002 / 2003):
+  Receptor generates a Coulombic potential `V(r) = Σⱼ qⱼ / |r − rⱼ|`
+  (zeroed inside the receptor SC shape), ligand stores its partial
+  charge at the nearest grid cell of each atom, and `score_elec` accumulates
+  the Coulomb interaction energy `ΣΣ qᵢ qⱼ / rᵢⱼ` over all (lig × rec)
+  atom pairs. β scales this energy in `score_total`.
+
+- **`"legacy"`**: the original training notebook's formulation —
+  `Σq / Σr` pseudo-quantity restricted to same-atomtype pairs, no
+  receptor-core zeroing. Preserved for bit-exact reproduction of the
+  master's thesis numbers. Fails several physics sanity checks (see
+  `tests/test_physics.py`) and is therefore **not** recommended for new
+  work.
+
+See `../docking/PORT_PLAN.md` entries B10 / B11 / B12 / B13 for the
+details of what was wrong with the original `legacy` formulation.
 
 ### 2. Gradients
 
@@ -201,6 +224,8 @@ docking_torch/
     ├── test_phase5.py      ← docking_score_elec end-to-end (1)
     ├── test_phase6_grad.py ← autograd vs Julia FD (1)
     ├── test_phase7_train.py← Adam smoke (30 ep) + `slow` 200-epoch (1+1)
+    ├── test_physics.py     ← Coulombic ELEC primitives: sign, 1/r, superposition,
+    │                         cross-type pair contribution, autograd (5)
     └── test_orient.py      ← orient matches Julia SVD bit-exact (1)
 ```
 

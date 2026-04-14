@@ -52,7 +52,7 @@ alpha = ALPHA; beta = BETA
 iface_flat = reshape(MDToolbox.get_iface_ij(), :) |> Array{Float64}
 charge = get_charge_score()
 
-lossfn(a, ifs, b, chs) = sum(docking_score_elec(receptor, ligands, a, ifs, b, chs))
+lossfn(a, ifs, b, chs) = sum(docking_score_elec_coulomb(receptor, ligands, a, ifs, b, chs))
 
 function fd(f, h)
     return (f(h) - f(-h)) / (2h)

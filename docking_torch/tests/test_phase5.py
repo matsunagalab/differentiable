@@ -66,8 +66,12 @@ def test_docking_score_elec_matches_julia(load_ref, device, dtype):
         np.asarray(ref["lig_charge_id"]), device=device, dtype=torch.int64
     )
 
+    # Compare against Julia's Coulombic reference (physically correct,
+    # matches PyTorch's default `elec_mode="coulomb"`). The legacy Σq/Σr
+    # reference is preserved in the HDF5 under "score_elec_total" for
+    # thesis reproduction but isn't used here.
     expected = torch.as_tensor(
-        np.asarray(ref["score_elec_total"]), device=device, dtype=dtype
+        np.asarray(ref["score_coulomb_total"]), device=device, dtype=dtype
     )
 
     # Timing for reporting (not asserted).
