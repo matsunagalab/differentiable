@@ -145,6 +145,49 @@ thresholds. MPS per-pose latency drops below CPU (expected target: ≤
 
 ---
 
+## F-5: Device-consistency hardening for cross-accelerator use
+
+**Summary.** Make `ProteinInputs`, `zdock.geom`, and `zdock.spread`
+robust against device mismatches so CPU/CUDA/MPS mixing raises a
+clear error (or is handled via `.to()`) instead of failing deep
+inside a tensor op.
+
+**Current state.** `train()` creates parameters (`alpha`, `beta`,
+`iface`, `charge`) on the user-requested `device`, but
+`ProteinInputs` tensors can live on a different device. Similarly,
+`geom.rotate` / `spread_neighbors_*` silently rely on every input
+sharing a device — a mismatch surfaces as a cryptic PyTorch error
+far from the real cause. (Noted while reviewing the `set_charge`
+/ `train()` input-validation fix in commit `d00abbb`.)
+
+**Work items.**
+1. Add `ProteinInputs.to(device, dtype=None) -> ProteinInputs`
+   that returns a new dataclass with every tensor field moved
+   (mirrors `torch.nn.Module.to`).
+2. In `train()`, call `p.to(device, dtype)` on each protein up
+   front, or assert `p.rec_xyz.device == device` and raise a
+   clear ValueError naming the offending field.
+3. In `geom.rotate`, assert `q.device == x.device` (same for
+   `y`, `z`); in `spread._neighbors_indices`, assert
+   `xyz.device == x_grid.device == y_grid.device == z_grid.device`.
+4. Tests: one `pytest.mark.skipif(not cuda/mps available)` test
+   that constructs a `ProteinInputs` on CPU, calls `.to("cuda")`
+   or `.to("mps")`, and verifies `train([p], device=...)` runs
+   one epoch without error. On CPU-only machines, add a
+   negative test that feeds a CPU `q` to `rotate` with a GPU
+   `x` (via a mock device tag) and expects the new assertion.
+
+**Dependencies.** None.
+
+**Estimate.** 0.5 day.
+
+**Verification.** Running `ZDOCK_DEVICE=cuda pytest -q` or
+`ZDOCK_DEVICE=mps pytest -q` on an accelerator host passes
+without any implicit `.cpu()` fallbacks; deliberate device
+mismatches raise a `ValueError` naming the field.
+
+---
+
 ## Not doing (explicitly out of scope)
 
 - **Rewriting Julia `rrule`** for `docking_score_elec_coulomb`. The
