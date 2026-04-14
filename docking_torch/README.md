@@ -242,6 +242,29 @@ docking_torch/
 MPS gains relative to CPU scale with F. At F=100 on a CUDA A100, expect
 50–100× speedup over single-core CPU.
 
+### Reproducing the CPU vs GPU comparison
+
+`benchmark_gpu.py` sweeps F ∈ {10, 40, 100} on CPU and CUDA, reporting
+forward and forward+backward timings plus the CPU/GPU speedup ratio. It
+uses the phase5 1KXQ reference inputs and tiles the 10 ligand poses
+along the frame axis to reach each target F.
+
+```bash
+# Pick an idle GPU (e.g. index 2) and run:
+CUDA_VISIBLE_DEVICES=2 uv run python benchmark_gpu.py
+```
+
+Measured on an RTX A6000 (float32 on CUDA, float64 / OMP=1 on CPU):
+
+| F   | CPU fwd | CPU fwd+bwd | CUDA fwd | CUDA fwd+bwd | speedup fwd | speedup fwd+bwd |
+|----:|--------:|------------:|---------:|-------------:|------------:|----------------:|
+|  10 |  361 ms |      326 ms |  16.4 ms |      20.3 ms |         22× |             16× |
+|  40 |  976 ms |     1028 ms |  18.6 ms |      22.3 ms |         53× |             46× |
+| 100 | 2482 ms |     2626 ms |  24.6 ms |      28.3 ms |        101× |             93× |
+
+CUDA wall time is nearly flat in F (launch overhead dominates), so the
+speedup grows with pose batch size.
+
 ## Troubleshooting
 
 ### MPS warning about `aten::linalg_svd`
