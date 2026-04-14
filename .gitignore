@@ -2,6 +2,9 @@
 .DS_Store
 **/.DS_Store
 
+# Local reference literature (keep out of git)
+docking_torch/ref/
+
 # Byte-compiled / optimized / DLL files
 __pycache__/
 *.py[cod]
