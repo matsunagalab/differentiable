@@ -229,6 +229,80 @@ docking_torch/
     └── test_orient.py      ← orient matches Julia SVD bit-exact (1)
 ```
 
+## Examples
+
+Three runnable demo scripts live under `examples/`. They cover the
+normal workflow: score-and-visualize, train, and before/after eval.
+All outputs land in `docking_torch/out/`.
+
+### Setup
+
+```bash
+cd docking_torch
+uv sync                 # installs zdock editable + matplotlib (dev group)
+# or, in an existing venv:
+# uv pip install -e ".[plot]"
+```
+
+Then any example runs via `uv run python examples/<script>.py`. Pick a
+GPU by prefixing `CUDA_VISIBLE_DEVICES=<idx>` and/or passing
+`--device cuda` (default `auto`: CUDA → MPS → CPU).
+
+### (1) Scoring + visualization — `examples/01_score_and_visualize.py`
+
+```bash
+uv run python examples/01_score_and_visualize.py
+# CUDA_VISIBLE_DEVICES=2 uv run python examples/01_score_and_visualize.py --device cuda
+```
+
+Loads the 1KXQ phase5 reference (10 ZDOCK candidate poses), scores them
+with default parameters (α=0.01, β=3.0, LUT iface/charge), prints a
+ranked table alongside Julia's `score_coulomb_total` for sanity, and
+writes:
+
+- `out/01_poses.pdb` — multi-model point-cloud (receptor as chain R,
+  top-K ligand poses as chain L) openable in PyMOL / ChimeraX
+- `out/01_poses.png` — matplotlib 3D scatter preview
+
+### (2) Training — `examples/02_train.py`
+
+```bash
+uv run python examples/02_train.py                              # default: 1KXQ, 200 epochs
+uv run python examples/02_train.py --epochs 30 --device cuda    # GPU smoke
+uv run python examples/02_train.py --proteins 1KXQ 1F51 2VDB    # after F-2 adds HDF5 refs
+```
+
+Runs `zdock.train.train` over the given proteins and saves:
+
+- `out/trained_params.pt` — dict with `alpha`, `beta`, `iface`, `charge`,
+  `history`, `proteins`
+- `out/02_loss_curve.png` — epoch-vs-loss plot (log y)
+
+**Extending the dataset:** add one line per new protein to `DATASETS`
+in `examples/_data.py` mapping the ID to its phase5 HDF5 path. Both
+`02_train.py` and `03_evaluate.py` pick it up automatically — the
+scripts never need to change.
+
+### (3) Before / after evaluation — `examples/03_evaluate.py`
+
+```bash
+uv run python examples/03_evaluate.py --params out/trained_params.pt
+# After F-3 test-set refs exist:
+# uv run python examples/03_evaluate.py --params out/trained_params.pt --proteins 1CGI 1ZHI
+```
+
+Scores each protein's poses twice — with the untrained defaults and
+with the `.pt` parameters — and reports per-protein Hit/Miss mean
+scores, ΔScore, and the best (1-based) rank of any Hit pose.
+Also writes `out/03_before_after.png` (before-vs-after scatter,
+Hits coloured, `y = x` diagonal for reference).
+
+With only `1KXQ` currently available and a synthetic `hit_mask`
+(first 3 poses labelled Hit, matching the convention in
+`tests/test_phase7_train.py`), this is a minimal but structurally
+complete evaluation. The same script will scale to the full
+benchmark once F-2 / F-3 HDF5 refs are added.
+
 ## Timing on 1KXQ, 10 poses, α=0.01, β=3.0
 
 | Operation | CPU (float64, M2) | MPS (float32, M2) | Notes |
