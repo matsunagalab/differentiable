@@ -248,7 +248,12 @@ def set_charge(
     out = torch.zeros(n, dtype=torch.int64)
     is_first_n = True
     for i, (r, a) in enumerate(zip(resnames, atomnames)):
-        if a == "N":
+        # Check PRO/N *before* the generic `a == "N"` branch: proline's
+        # backbone nitrogen is a secondary amine and must get charge id 7
+        # regardless of sequence position.
+        if r == "PRO" and a == "N":
+            out[i] = 7  # PRO N
+        elif a == "N":
             if is_first_n:
                 out[i] = 1  # TERMINAL-N
                 is_first_n = False
@@ -266,8 +271,6 @@ def set_charge(
             out[i] = 5
         elif r == "LYS" and a == "NZ":
             out[i] = 6
-        elif r == "PRO" and a == "N":
-            out[i] = 7
         else:
             out[i] = 8
     return out

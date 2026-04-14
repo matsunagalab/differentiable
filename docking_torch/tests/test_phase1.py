@@ -143,15 +143,80 @@ def test_set_atomtype_id_ligand_matches_julia(ligand_ref):
     )
 
 
+def _pro_n_mask(resnames, atomnames) -> torch.Tensor:
+    """Positions where our Python `set_charge` intentionally diverges from the
+    Julia reference: proline backbone nitrogens. Julia's ladder evaluated
+    `a == "N"` *before* the `PRO + N` branch so PRO/N atoms got charge id 1
+    or 11 depending on sequence position. The Python port fixes this so they
+    always get charge id 7 (the intended PRO-N class in `_CHARGE_SCORE`)."""
+    return torch.tensor(
+        [r == "PRO" and a == "N" for r, a in zip(resnames, atomnames)],
+        dtype=torch.bool,
+    )
+
+
 def test_set_charge_receptor_matches_julia(receptor_ref):
     got = atomtypes.set_charge(
         receptor_ref["resname"], receptor_ref["atomname"]
     )
     expected = torch.as_tensor(np.asarray(receptor_ref["charge"]), dtype=torch.int64)
-    torch.testing.assert_close(got, expected)
+    pro_n = _pro_n_mask(receptor_ref["resname"], receptor_ref["atomname"])
+    # Outside PRO/N positions, we must match Julia exactly.
+    torch.testing.assert_close(got[~pro_n], expected[~pro_n])
+    # At PRO/N positions, the Python port always returns 7 (the fix).
+    assert pro_n.any(), "receptor reference unexpectedly has no PRO/N atoms"
+    assert torch.all(got[pro_n] == 7)
 
 
 def test_set_charge_ligand_matches_julia(ligand_ref):
     got = atomtypes.set_charge(ligand_ref["resname"], ligand_ref["atomname"])
     expected = torch.as_tensor(np.asarray(ligand_ref["charge"]), dtype=torch.int64)
-    torch.testing.assert_close(got, expected)
+    pro_n = _pro_n_mask(ligand_ref["resname"], ligand_ref["atomname"])
+    torch.testing.assert_close(got[~pro_n], expected[~pro_n])
+    if pro_n.any():
+        assert torch.all(got[pro_n] == 7)
+
+
+# --------------------------------------------------------- set_charge regressions
+
+
+def test_set_charge_pro_n_returns_7():
+    """Regression: PRO/N must map to charge id 7, not be swallowed by the
+    generic `a == "N"` branch (bug: previously returned 1)."""
+    got = atomtypes.set_charge(["PRO"], ["N"])
+    assert got.tolist() == [7]
+
+
+def test_set_charge_first_plain_n_is_terminal():
+    """The first non-PRO backbone N in the sequence is still the N-terminus
+    (charge id 1)."""
+    got = atomtypes.set_charge(["ALA"], ["N"])
+    assert got.tolist() == [1]
+
+
+def test_set_charge_later_plain_n_is_generic():
+    """Non-first non-PRO backbone N gets the generic amide nitrogen id (11)."""
+    got = atomtypes.set_charge(["ALA", "GLY"], ["N", "N"])
+    assert got.tolist() == [1, 11]
+
+
+def test_set_charge_pro_n_does_not_consume_first_n_slot():
+    """A leading PRO/N must not steal the TERMINAL-N (1) assignment from a
+    following plain N — it is classified independently as PRO N (7)."""
+    got = atomtypes.set_charge(["PRO", "ALA"], ["N", "N"])
+    assert got.tolist() == [7, 1]
+
+
+def test_set_charge_oxt_is_terminal_o():
+    """OXT is always the C-terminal oxygen (charge id 2), independent of
+    residue name."""
+    got = atomtypes.set_charge(["ALA"], ["OXT"])
+    assert got.tolist() == [2]
+
+
+def test_set_charge_mixed_sequence():
+    """Mixed sequence smoke test covering terminal-N, PRO/N, plain N, O, OXT."""
+    resnames = ["ALA", "PRO", "GLY", "ALA", "ALA"]
+    atomnames = ["N", "N", "N", "O", "OXT"]
+    got = atomtypes.set_charge(resnames, atomnames)
+    assert got.tolist() == [1, 7, 11, 10, 2]

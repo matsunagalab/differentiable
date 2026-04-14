@@ -12,7 +12,7 @@ import numpy as np
 import pytest
 import torch
 
-from zdock.train import ProteinInputs, train
+from zdock.train import ProteinInputs, total_loss, train
 
 
 def _2d(a):
@@ -93,3 +93,36 @@ def test_train_200_epoch_1kxq(load_ref, device, dtype):
     print(f"[train-200] α = {out['alpha'].item():.4e}  β = {out['beta'].item():.4e}")
     assert abs(out["alpha"]) < 1.0, "α drifted out of plausible range"
     assert abs(out["beta"]) < 10.0, "β drifted out of plausible range"
+
+
+# ---------------------------------------------------------- input-validation
+
+
+def test_train_rejects_nonpositive_progress_every():
+    """Regression: `progress_every=0` previously triggered a
+    ZeroDivisionError inside the epoch loop; it must now fail fast with a
+    clear ValueError, without needing a real ProteinInputs."""
+    with pytest.raises(ValueError, match="progress_every"):
+        train([], n_epoch=1, progress_every=0)
+    with pytest.raises(ValueError, match="progress_every"):
+        train([], n_epoch=1, progress_every=-5)
+
+
+def test_train_rejects_empty_proteins():
+    """Regression: `proteins=[]` previously reached `torch.stack([])` and
+    raised an opaque RuntimeError. It must now fail early with a clear
+    ValueError."""
+    with pytest.raises(ValueError, match="empty"):
+        train([], n_epoch=1, progress_every=1)
+
+
+def test_total_loss_rejects_empty_proteins():
+    """`total_loss` must also reject empty input directly — callers that
+    bypass `train` (e.g. tests) should still see a useful ValueError
+    instead of `torch.stack([])` failing mysteriously."""
+    alpha = torch.tensor(0.01, dtype=torch.float64)
+    beta = torch.tensor(3.0, dtype=torch.float64)
+    iface = torch.zeros(144, dtype=torch.float64)
+    charge = torch.zeros(11, dtype=torch.float64)
+    with pytest.raises(ValueError, match="empty"):
+        total_loss([], alpha, iface, beta, charge, [])

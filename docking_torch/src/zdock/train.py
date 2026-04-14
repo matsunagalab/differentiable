@@ -103,6 +103,14 @@ def total_loss(
 ) -> torch.Tensor:
     """Sum per-protein losses. `targets[i]` = (hit_target, miss_target)
     for proteins[i]."""
+    proteins = list(proteins)
+    if len(proteins) == 0:
+        raise ValueError("total_loss requires at least one protein; got an empty list")
+    if len(proteins) != len(targets):
+        raise ValueError(
+            f"proteins and targets must have equal length; got "
+            f"{len(proteins)} proteins, {len(targets)} targets"
+        )
     parts = []
     for p, (ht, mt) in zip(proteins, targets):
         scores = p.call(alpha, iface, beta, charge)
@@ -122,7 +130,18 @@ def train(
 ) -> dict:
     """Run the full Adam optimization and return the trained parameters
     plus a loss history. Targets are frozen at their pre-training values
-    (the "ideal score distribution" scheme)."""
+    (the "ideal score distribution" scheme).
+
+    Raises ValueError if `progress_every <= 0` or `proteins` is empty —
+    both were previously silent failures (ZeroDivisionError / opaque
+    RuntimeError from torch.stack).
+    """
+    if progress_every <= 0:
+        raise ValueError(
+            f"progress_every must be a positive integer, got {progress_every}"
+        )
+    if len(proteins) == 0:
+        raise ValueError("train requires at least one protein; got an empty list")
     # Initial parameters — same as Julia `train_param-apart.ipynb` cell
     # 27-28 defaults.
     alpha = torch.tensor(0.01, device=device, dtype=dtype, requires_grad=True)
