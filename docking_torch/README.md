@@ -289,9 +289,12 @@ IFACE grouping conventions (see B9 in `PORT_PLAN.md`) is easy to break.
 ## Pointers
 
 - **Parent project**: `../docking/` — Julia version, master thesis, full plan
-- **Port plan**: `../docking/PORT_PLAN.md` — bug list B1–B9 and rationale
+- **Port plan**: `../docking/PORT_PLAN.md` — bug list B1–B15 and rationale
+- **Follow-up tasks** (not required for basic use):
+  [FOLLOWUPS.md](FOLLOWUPS.md) — F-1 CHARMM19 charges, F-2 full 3-protein
+  training, F-3 test-protein Rank evaluation, F-4 `torch.compile`.
 - **B4 physics note**: `../docking/tests/julia_ref/b4_physics_report.md`
-  (Σq/Σr vs Σq/r)
+  (Σq/Σr vs Σq/r) — superseded by the Phase C section of PORT_PLAN.md
 - **Julia reference tests**: `../docking/tests/julia_ref/README.md`
 - **Master's thesis**: `../docking/master_thesis/ICS-25M-23MM336.pdf`
 
