@@ -18,6 +18,135 @@ for the full list.
   (Chen 2002/2003 formulation), with a `legacy` mode for bit-exact
   thesis reproduction — see below
 
+## How the scoring works
+
+This section describes what `docking_score_elec` computes and why
+each piece is differentiable, so you can read `score.py` with a
+mental model already in place.
+
+### What we're computing
+
+Protein–protein docking asks: given two protein structures (a
+**receptor** and a **ligand**), which spatial arrangements (poses)
+represent a plausible binding complex? This package does **not**
+search for poses — that is done upstream by ZDOCK, which outputs
+hundreds of candidate poses. Instead, `docking_score_elec` **re-scores**
+F candidate poses in a single batched call and returns a score per pose:
+
+```
+score[f] = α · S_SC[f]  +  S_IFACE[f]  +  β · S_ELEC[f]
+```
+
+| Term | Full name | What it captures |
+|------|-----------|-----------------|
+| S_SC | Shape Complementarity | How well the molecular surfaces fit together |
+| S_IFACE | Interface statistics | Atom-type pairwise contact preferences |
+| S_ELEC | Electrostatic energy | Coulombic charge–charge interaction |
+| α, β | Weight scalars | Relative importance of SC vs ELEC |
+
+**Learnable parameters:** α (1) + β (1) + iface_ij (12×12 = 144) +
+charge_score (11) = **157 total**, all differentiable via PyTorch autograd.
+
+### Grid-based evaluation
+
+Atoms are **scattered onto a 3D grid** (default spacing 3 Å) so that
+scoring reduces to grid inner products — fast and GPU-friendly.
+
+```
+Receptor atoms ──→ scatter ──→ Receptor grids ──┐
+     (one-time precompute)     (SC, H[j], V)    │
+                                                 │  inner product
+Ligand pose[f] ──→ scatter ──→ Ligand grids  ───┤  (per frame f)
+     (repeated per pose)       (SC, L[i], Q)    │
+                                                 ↓
+                                  score[f] = α·SC + IFACE + β·ELEC
+```
+
+The receptor grids are built **once**; only the ligand side is
+recomputed per pose. Cost is O(V + N_atoms) per pose (V = number of
+grid cells), much cheaper than the naive O(N_rec × N_lig) all-pairs
+evaluation.
+
+### Shape complementarity (SC)
+
+SC detects whether the molecular **surfaces** fit snugly while
+penalizing **core–core** clashes (steric overlap).
+
+1. Atoms are classified as **surface** (SASA > 1.0 Å²) or **core**.
+2. For each molecule, atoms are spread onto the grid with radii-scaled
+   cutoffs, producing a real part (shape envelope) and an imaginary
+   part (penetration penalty weight — 3.5 for surface, 12.25 for core).
+3. The receptor's and ligand's grids are combined via **complex
+   multiplication** and summed over all cells:
+   - Surface–surface contact → **positive** (favorable fit).
+   - Core–core overlap → **large negative** (steric clash).
+
+This follows Chen & Weng, *Proteins* 2002.
+
+### Interface statistics (IFACE)
+
+IFACE captures which **atom-type pairs** are in contact at the
+receptor–ligand interface.
+
+1. All atoms carry one of **12 atom types** (atomtype_id 1–12, assigned
+   by residue name + atom name via `atomtypes.py`).
+2. **Receptor** — for each type j, a grid slab `H[j]` counts how many
+   type-j atoms lie within 6 Å of each cell → shape (12, nx, ny, nz).
+3. **Ligand** — for each type i, `L[f, i]` is a binary indicator of
+   whether a type-i atom occupies each cell → shape (F, 12, nx, ny, nz).
+4. The pairwise overlap is computed in one shot by **einsum**:
+   `T[f, i, j] = Σ_cells L[f, i, cell] × H[j, cell]`.
+5. The IFACE score weights each pair by the learnable matrix:
+   `S_IFACE[f] = Σ_ij iface_ij[i, j] × T[f, i, j]`.
+
+The 144 entries of `iface_ij` encode atom-type "affinities" — training
+adjusts them so that native-like contacts contribute more than
+non-native ones.
+
+### Electrostatics (ELEC) — Coulomb mode
+
+ELEC evaluates the **Coulombic interaction energy** between all
+receptor and ligand atoms, mediated through the grid.
+
+1. **Receptor** — build a potential grid
+   `V(r) = Σ_j q_j / |r − r_j|` using `spread_neighbors_coulomb`
+   (cutoff 8 Å). Cells inside the receptor core (SC envelope > 0) are
+   zeroed out (Chen 2002, §2.2).
+2. **Ligand** — scatter each atom's partial charge q onto the nearest
+   grid cell → `Q[f]` of shape (F, nx, ny, nz).
+3. **Interaction** — inner product:
+   `S_ELEC[f] = Σ_cells V(cell) × Q[f, cell] ≈ ΣΣ q_i q_j / r_ij`.
+   - Opposite charges (attraction) → negative.
+   - Like charges (repulsion) → positive.
+4. β scales the electrostatic contribution in the total score.
+
+The 11-element `charge_score` look-up table maps each atom's charge
+type to a partial charge value. These are also learnable — training
+can fine-tune the effective charge strengths.
+
+This follows Chen, Li & Bhatt, *Proteins* 2003.
+
+### Differentiability and training
+
+Every operation in the pipeline — `scatter_add`, `einsum`,
+element-wise arithmetic, reductions — has a built-in PyTorch backward
+pass. Calling `loss.backward()` propagates gradients through the
+entire scoring function to all 157 parameters.
+
+Training (see `train.py`) works as follows:
+
+1. Poses are labelled **Hit** (RMSD ≤ threshold to the native complex)
+   or **Miss**.
+2. Targets are set once before training: all Hit poses target the
+   maximum pre-training score; all Miss poses target the minimum.
+3. A per-class MSE loss (Hit term + Miss term, averaged separately)
+   is minimized with **Adam** over 200 epochs.
+4. After training, Hit poses should score higher → better ranking.
+
+The Julia notebook had a bug (B2) that silently dropped five of the
+six MSE terms; the port fixes this, so all protein contributions
+actually affect the gradient.
+
 ## Quick start
 
 Requires [uv](https://docs.astral.sh/uv/).
