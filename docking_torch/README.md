@@ -313,7 +313,73 @@ print("optimized α, β:", out["alpha"].item(), out["beta"].item())
 The loss is the B2-fixed 6-term MSE (all terms contribute; the Julia
 notebook's newline-continuation bug silently dropped five of them).
 
-### 4. Regenerating the reference HDF5 (usually unnecessary)
+### 4. Training on the BM4 dataset (student workflow)
+
+The **ZDOCK Benchmark 4** covers 176 protein-protein pairs × 54000
+ZDOCK poses each. `scripts/build_training_dataset.py` consolidates it
+into a single HDF5 file (`datasets/bm4_full.h5`, ~96 GB) that
+`examples/04_train_on_bm4.py` can split 70 / 30 and train on.
+
+#### Step 1. Obtain the dataset
+
+**Option A — download from the shared location** (ask your advisor
+for the URL). ~96 GB single file; drop it under
+`docking_torch/datasets/bm4_full.h5` and move to step 2.
+
+**Option B — rebuild from raw inputs** (~50 min, needs the sibling
+Julia project checked out):
+
+```bash
+uv run python scripts/build_training_dataset.py \
+    --benchmark-root ../docking/decoys_bm4_zd3.0.2_6deg_fixed \
+    --output datasets/bm4_full.h5 \
+    --skip-errors
+```
+
+This walks every protein in `results/`, reads the extended `*.pdb.ms`
+files, reconstructs all 54000 ligand poses per protein via the
+Python port of `create_lig.cc`, reads the `*.rmsds` files, and
+writes one group per protein with `hit_mask = rmsd <= 2.5 Å`.
+47 proteins fail the Julia atomtype rule ladder (cofactors like
+HEM / ATP / MSE) and are skipped; the remaining **129 proteins**
+include the thesis triple (1KXQ + 1F51 + 2VDB) and the hold-out
+pair (1CGI + 1ZHI).
+
+Smaller builds are fine too — `--max-poses 2000` gives a ~3-4 GB
+file suitable for email attachment / quick experimentation.
+
+#### Step 2. Train with the one-command example
+
+```bash
+uv run python examples/04_train_on_bm4.py
+```
+
+See **Examples → (4)** below for the knobs. The defaults (10 proteins
+× top-100 poses × 50 epochs) finish in under a minute on CPU; scale
+up with `--n-proteins all --top-k 2000` once you trust the pipeline.
+
+#### Step 3. (Optional) Load the dataset yourself
+
+If you want to go beyond the example script:
+
+```python
+from zdock.data import list_proteins, load_training_dataset
+
+print(list_proteins("datasets/bm4_full.h5"))          # 129 protein IDs
+
+proteins = load_training_dataset(
+    "datasets/bm4_full.h5",
+    protein_names=["1KXQ", "1F51", "2VDB"],          # pick any subset
+    rmsd_threshold_angstrom=5.0,                      # optional: override
+    device="mps", dtype=torch.float32,
+)
+# -> list of ProteinInputs, one per name, ready for train([...])
+```
+
+Every group carries the raw `rmsd` array too, so you can re-derive
+`hit_mask` with any threshold without rebuilding.
+
+### 5. Regenerating the reference HDF5 (usually unnecessary)
 
 The `.h5` files under `../docking/tests/refs/1KXQ/` are the gold outputs
 from the patched Julia reference. If you need to regenerate them:
@@ -431,6 +497,39 @@ With only `1KXQ` currently available and a synthetic `hit_mask`
 `tests/test_phase7_train.py`), this is a minimal but structurally
 complete evaluation. The same script will scale to the full
 benchmark once F-2 / F-3 HDF5 refs are added.
+
+### (4) Train + evaluate on the BM4 dataset — `examples/04_train_on_bm4.py`
+
+Once `datasets/bm4_full.h5` exists (see **Training on the BM4 dataset**
+below), this script is the one-command entry point for students.
+Proteins are split 70 % train / 30 % test (deterministic per `--seed`),
+the model trains on the train set, and ranking quality is reported on
+both sets.
+
+```bash
+# Defaults: 10 proteins, top-100 poses, 50 epochs (~under a minute)
+uv run python examples/04_train_on_bm4.py
+
+# Full dataset (129 proteins × top-2000 poses) on MPS / CUDA
+uv run python examples/04_train_on_bm4.py --n-proteins all --top-k 2000 --device mps
+
+# Tweak anything you want:
+uv run python examples/04_train_on_bm4.py \
+    --n-proteins 30 --top-k 500 --epochs 100 --split 0.7 --seed 123
+```
+
+The two knobs students use most:
+
+| Flag | Meaning | Default |
+|---|---|---|
+| `--n-proteins` | how many proteins from the 129 available | 10 |
+| `--top-k` | how many top-ranked ZDOCK poses per protein | 100 |
+
+Other flags: `--split` (train fraction), `--seed`, `--epochs`, `--lr`,
+`--device`, `--top-k-eval` (Hit-in-top-K metric width).
+
+Output: `out/trained_params_bm4.pt` with the learned parameters,
+history, and the exact train/test split used.
 
 ## Timing on 1KXQ, 10 poses, α=0.01, β=3.0
 
