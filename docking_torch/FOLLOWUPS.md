@@ -198,6 +198,56 @@ mismatches raise a `ValueError` naming the field.
 
 ---
 
+## F-6: Extend atomtype LUT to cover BM4 non-standard residues
+
+**Summary.** Add rules for cofactors (HEM, ATP/ADP/GDP/GNP/GCP/NAP/GTP
+phosphate atoms) and modified amino acids (MSE, SOC, DVA, P34) so
+`set_atomtype_id` / `set_charge` / `set_radius` stop raising on 27 %
+of the BM4 benchmark.
+
+**Current state.** The consolidated dataset builder
+(`scripts/build_training_dataset.py`) succeeded on 129 / 176 BM4
+proteins (thesis triple 1KXQ + 1F51 + 2VDB all green). 47 proteins
+failed with `failed to assign atom type for (resname=X, atomname=Y)`
+where X/Y is a cofactor / modified residue not present in the Julia
+rule ladder. Representative misses:
+
+  - HEM/FE (heme iron)
+  - ATP/PG, ADP/PB, GDP/PA, GNP/PA/PG, GCP/PC, NAP/P2B (nucleotide
+    phosphate backbone)
+  - MSE/N (selenomethionine)
+  - SOC/N, DVA/N, P34/N (modified residue backbone nitrogens)
+
+The full failure list is in the last ~20 lines of
+`/tmp/bm4_build.log` from the 2026-04-21 build.
+
+**Work items.**
+1. Grep `docking_canonical.jl`'s `set_atomtype_id` for any existing
+   cofactor coverage we missed in the Python port. Confirm Julia
+   also crashes on these residues (likely — the original training
+   set avoided them).
+2. Decide a classification: e.g. all cofactor heavy atoms → the
+   generic `AILMV_mc` bucket (id 12) as a conservative default;
+   HEM/FE → its own row/col in a future iface_ij extension or map
+   to an existing metal-like class.
+3. Extend `src/zdock/_atomtype_rules.py` with the new rules. Mirror
+   same changes in `zdock.atomtypes.set_charge` for the PO3-like
+   atoms that carry partial charge.
+4. Re-run the full builder; target ≥95 % BM4 success rate.
+
+**Dependencies.** None. Independent of F-2 through F-5.
+
+**Estimate.** 1 day (rule research + LUT extension + rebuild +
+spot-check scores on a rescued protein).
+
+**Verification.** After extending the LUT, `uv run python
+scripts/build_training_dataset.py --benchmark-root .../BM4
+--output datasets/bm4_full_v2.h5` completes with ≥170 / 176
+successful groups. Training on a rescued protein (e.g. 1WQ1 with
+GCP) produces non-NaN gradients.
+
+---
+
 ## Not doing (explicitly out of scope)
 
 - **Rewriting Julia `rrule`** for `docking_score_elec_coulomb`. The
