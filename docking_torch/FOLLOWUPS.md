@@ -48,24 +48,34 @@ benchmark.
 
 ---
 
-## F-2: Full three-protein training (reproduce thesis Fig 5.1–5.5)
+## F-2: Full multi-protein training (reproduce thesis Fig 5.1–5.5)
 
-**Summary.** Train α, β, iface, charge_score on 1KXQ + 1F51 + 2VDB
+**Summary.** Train α, β, iface, charge_score on multiple proteins
 simultaneously for 200 epochs and compare the loss curve / final
 parameters against the thesis numbers.
 
-**Current state.** `tests/test_phase7_train.py::test_train_200_epoch_1kxq`
-trains on 1KXQ only and reports 78 % loss reduction. 1F51 and 2VDB
-decoy trajectories exist in `../docking/protein/{1F51,2VDB}/`, but
-they are not wired into the Julia reference generator.
+**Current state (updated).** The Python data-prep pipeline is in
+place — `scripts/build_training_dataset.py` converts the full BM4
+benchmark (176 proteins × 54000 poses) into a single consolidated
+h5 via the `create_lig.cc` Python port in `zdock.zdock_output` and
+the extended-PDB parser in `zdock.io`. The loader
+`zdock.data.load_training_dataset(h5, ...)` returns a list of
+`ProteinInputs` ready for `train(...)`. `tests/test_phase7_train.py
+::test_train_with_consolidated_h5` proves the pipeline end-to-end
+on a smoke subset (1KXQ, 100 poses). Thesis 3-protein reproduction
+is no longer dependent on the Julia reference generator.
 
 **Work items.**
-1. Extend `docking/tests/julia_ref/generate_refs.jl` so it emits
-   `phase5_1F51.h5` and `phase5_2VDB.h5` with the same schema (prepared
-   rec/lig inputs + coulomb / legacy scores).
+1. Build the full dataset:
+   ```
+   uv run python scripts/build_training_dataset.py \
+     --benchmark-root ../docking/decoys_bm4_zd3.0.2_6deg_fixed \
+     --output datasets/bm4_full.h5
+   ```
+   (Expected size ~30-40 GB gzipped; ~60-90 min one-time runtime.)
 2. Add `scripts/train_full.py` (or a `@pytest.mark.slow` test) that
-   loads all three proteins into a list of `ProteinInputs` and runs
-   `zdock.train.train(proteins=[p1, p2, p3], n_epoch=200)`.
+   loads the three thesis proteins (1KXQ, 1F51, 2VDB) from the full
+   h5 and runs `train(proteins=[...], n_epoch=200)`.
 3. Log per-epoch loss + the 157 parameter values; compare to thesis
    Figure 5.1 (loss curve 4.32×10⁴ → ~1.52×10⁴) and Figure 5.5
    (Hit / Rank table).

@@ -8,6 +8,8 @@ the 1F51 / 2VDB reference inputs and isn't exercised here — the machinery
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import numpy as np
 import pytest
 import torch
@@ -126,3 +128,39 @@ def test_total_loss_rejects_empty_proteins():
     charge = torch.zeros(11, dtype=torch.float64)
     with pytest.raises(ValueError, match="empty"):
         total_loss([], alpha, iface, beta, charge, [])
+
+
+# ---------------------------------------------------- consolidated h5 path
+
+
+_SMOKE_H5 = Path("/tmp/smoke.h5")
+
+
+@pytest.mark.skipif(
+    not _SMOKE_H5.exists(),
+    reason=f"smoke dataset missing at {_SMOKE_H5}; run "
+           "`uv run python scripts/build_training_dataset.py --proteins 1KXQ "
+           "--max-poses 100 --output /tmp/smoke.h5`",
+)
+def test_train_with_consolidated_h5(device, dtype):
+    """End-to-end: load the smoke h5 via `zdock.data` and train 5 epochs."""
+    from zdock.data import load_training_dataset
+
+    proteins = load_training_dataset(
+        _SMOKE_H5, device=device, dtype=dtype, protein_names=["1KXQ"],
+    )
+    assert len(proteins) == 1
+    p = proteins[0]
+    # Sanity: enough poses and at least one hit so the loss has gradient signal.
+    assert p.lig_xyz.shape[0] >= 10
+    assert p.hit_mask.any() and (~p.hit_mask).any()
+
+    out = train(
+        [p], n_epoch=5, lr=0.01, device=device, dtype=dtype, progress_every=5,
+    )
+    hist = out["history"]["loss"]
+    assert len(hist) == 5
+    # With only 5 epochs the loss can still wobble; just require no NaN.
+    assert all(torch.isfinite(torch.tensor(x)) for x in hist), (
+        f"loss history contains non-finite values: {hist}"
+    )

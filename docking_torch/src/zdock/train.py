@@ -41,6 +41,7 @@ class ProteinInputs:
     lig_atomtype_id: torch.Tensor
     lig_charge_id: torch.Tensor
     hit_mask: torch.Tensor             # (F,) bool: True for Positive poses
+    rmsd: torch.Tensor | None = None   # (F,) optional raw RMSD (Å) to re-threshold later
 
     def call(
         self,
