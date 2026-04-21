@@ -1,17 +1,19 @@
 # zdock — Differentiable ZDOCK in PyTorch
 
 PyTorch port of the Julia implementation in `../docking/` (`docking.jl` +
-`train_param-apart.ipynb`). Lets you **optimize the 157 ZDOCK scoring
-parameters (α, β, IFACE 144, charge 11) end-to-end with Adam**. Nine bugs
-found in the Julia reference are fixed here; see `../docking/PORT_PLAN.md`
-for the full list.
+`train_param-apart.ipynb`). Lets you **optimize the 156 learnable ZDOCK
+scoring parameters (α, IFACE 144, charge 11) end-to-end with Adam**;
+β is held fixed at 3.0 because it is mathematically redundant with an
+overall scaling of `charge_score`. Nine bugs found in the Julia
+reference are fixed here; see `../docking/PORT_PLAN.md` for the full
+list.
 
 ## Highlights
 
 - **Pure PyTorch** — NumPy and h5py are only for reference I/O
 - **Same code runs on macOS (MPS) and Linux (CUDA)** out of the box
 - Numerical agreement with the Julia reference is guaranteed by pytest
-  (all 28 tests green on CPU + MPS; training and physics tests included)
+  (all 58 tests green on CPU + MPS; training and physics tests included)
 - PyTorch autograd replaces the buggy hand-written `rrule` in Julia
 - Per-frame work is fused into a single einsum for GPU-friendly batching
 - **Physically correct Coulombic electrostatics** by default
@@ -44,8 +46,11 @@ score[f] = α · S_SC[f]  +  S_IFACE[f]  +  β · S_ELEC[f]
 | S_ELEC | Electrostatic energy | Coulombic charge–charge interaction |
 | α, β | Weight scalars | Relative importance of SC vs ELEC |
 
-**Learnable parameters:** α (1) + β (1) + iface_ij (12×12 = 144) +
-charge_score (11) = **157 total**, all differentiable via PyTorch autograd.
+**Learnable parameters:** α (1) + iface_ij (12×12 = 144) +
+charge_score (11) = **156 total**, all differentiable via PyTorch autograd.
+β (also 1 scalar) is a function input but held fixed at 3.0 during
+training — it is scale-redundant with `charge_score` (see §
+*Differentiability and training*).
 
 ### Grid-based evaluation
 
@@ -131,7 +136,11 @@ This follows Chen, Li & Bhatt, *Proteins* 2003.
 Every operation in the pipeline — `scatter_add`, `einsum`,
 element-wise arithmetic, reductions — has a built-in PyTorch backward
 pass. Calling `loss.backward()` propagates gradients through the
-entire scoring function to all 157 parameters.
+entire scoring function to all 156 learnable parameters (α, iface_ij,
+charge_score). β is held fixed at 3.0: because `score_elec` is linear
+(coulomb mode) or quadratic (legacy mode) in `charge_score`, any β can
+be absorbed into an overall scaling of `charge_score`, so training β
+separately just adds a scale-redundant degree of freedom.
 
 Training (see `train.py`) works as follows:
 
@@ -278,14 +287,14 @@ Just let autograd do it:
 
 ```python
 alpha = torch.tensor(0.01, requires_grad=True)
-beta  = torch.tensor(3.0,  requires_grad=True)
+beta  = torch.tensor(3.0)  # held fixed — redundant with charge scaling
 iface = iface_ij(flat=True).clone().requires_grad_(True)
 charge = charge_score().clone().requires_grad_(True)
 
 scores = docking_score_elec(..., alpha, iface, beta, charge)
 loss = (scores - target).pow(2).sum()
 loss.backward()
-print(alpha.grad, beta.grad, iface.grad, charge.grad)
+print(alpha.grad, iface.grad, charge.grad)
 ```
 
 The Julia hand-written `rrule` had significant bugs (B5/B6/B7 — gradient
@@ -293,6 +302,11 @@ The Julia hand-written `rrule` had significant bugs (B5/B6/B7 — gradient
 against Julia central-difference gradients (see `test_phase6_grad.py`).
 
 ### 3. Adam training
+
+Low-level API — `zdock.train.train(proteins, n_epoch=…, lr=…)` takes a
+list of `ProteinInputs` and returns a dict with the learned `alpha`,
+`iface`, `charge` (β is kept fixed at 3.0 internally) plus a loss
+history:
 
 ```python
 from zdock.train import ProteinInputs, train
@@ -307,18 +321,25 @@ p = ProteinInputs(
 
 out = train([p], n_epoch=200, lr=0.01, device="mps", dtype=torch.float32)
 print("final loss:", out["history"]["loss"][-1])
-print("optimized α, β:", out["alpha"].item(), out["beta"].item())
+print("optimized α:", out["alpha"].item(), "  (β fixed at 3.0)")
 ```
 
 The loss is the B2-fixed 6-term MSE (all terms contribute; the Julia
 notebook's newline-continuation bug silently dropped five of them).
+
+For the end-to-end dataset workflow (load BM4 → 70/15/15 split → lr
+grid search on val → evaluate test), use `examples/02_train.py` and
+`examples/03_evaluate.py` instead — see **Examples → (2) / (3)** below.
 
 ### 4. Training on the BM4 dataset (student workflow)
 
 The **ZDOCK Benchmark 4** covers 176 protein-protein pairs × 54000
 ZDOCK poses each. `scripts/build_training_dataset.py` consolidates it
 into a single HDF5 file (`datasets/bm4_full.h5`, ~96 GB) that
-`examples/04_train_on_bm4.py` can split 70 / 30 and train on.
+`examples/02_train.py` splits 70 / 15 / 15 (train / val / test), sweeps
+a small learning-rate grid, picks the lr that maximises the val
+Hit-in-top-K metric, and stores the held-out test names in the ckpt so
+`examples/03_evaluate.py` can evaluate the untouched test split later.
 
 #### Step 1. Obtain the dataset
 
@@ -351,12 +372,14 @@ file suitable for email attachment / quick experimentation.
 #### Step 2. Train with the one-command example
 
 ```bash
-uv run python examples/04_train_on_bm4.py
+uv run python examples/02_train.py
+uv run python examples/03_evaluate.py     # evaluates the held-out test split
 ```
 
-See **Examples → (4)** below for the knobs. The defaults (10 proteins
-× top-100 poses × 50 epochs) finish in under a minute on CPU; scale
-up with `--n-proteins all --top-k 2000` once you trust the pipeline.
+See **Examples → (2) / (3)** below for the knobs. The defaults (10
+proteins × top-100 poses × 50 epochs × 3-point lr grid) finish in
+under a minute on CPU; scale up with `--n-proteins all --top-k 2000`
+once you trust the pipeline.
 
 #### Step 3. (Optional) Load the dataset yourself
 
@@ -410,18 +433,13 @@ docking_torch/
 │   │                         add/substitute, calculate_distance, coulomb)
 │   ├── score.py            ← docking_score_elec (frame-batched, 144 →
 │   │                         12×12 einsum)
-│   └── train.py            ← ProteinInputs, Adam loop, B2-fixed loss
-└── tests/
-    ├── conftest.py         ← device/dtype/tol fixtures, HDF5 loader
-    ├── test_phase1.py      ← LUTs, rotate, spiral, atom types (11 tests)
-    ├── test_phase2.py      ← SASA, grid generation (3)
-    ├── test_phase3.py      ← spread / calculate_distance (5)
-    ├── test_phase5.py      ← docking_score_elec end-to-end (1)
-    ├── test_phase6_grad.py ← autograd vs Julia FD (1)
-    ├── test_phase7_train.py← Adam smoke (30 ep) + `slow` 200-epoch (1+1)
-    ├── test_physics.py     ← Coulombic ELEC primitives: sign, 1/r, superposition,
-    │                         cross-type pair contribution, autograd (5)
-    └── test_orient.py      ← orient matches Julia SVD bit-exact (1)
+│   ├── train.py            ← ProteinInputs, Adam loop, B2-fixed loss
+│   ├── data.py             ← list_proteins / load_training_dataset
+│   │                         (consolidated BM4 HDF5 reader)
+│   ├── io.py               ← PDB / .ms / rmsds readers for dataset build
+│   └── zdock_output.py     ← ZDOCK `.out` + `create_lig` Python port
+└── tests/                  ← 58 tests: numerical parity with Julia,
+                              SASA / SVD / autograd / train / physics
 ```
 
 ## Examples
@@ -459,63 +477,27 @@ writes:
   top-K ligand poses as chain L) openable in PyMOL / ChimeraX
 - `out/01_poses.png` — matplotlib 3D scatter preview
 
-### (2) Training — `examples/02_train.py`
+### (2) Training on BM4 with val-based lr selection — `examples/02_train.py`
+
+One-command entry point for students. Proteins are split **70 % train
+/ 15 % val / 15 % test** at the protein level (deterministic per
+`--seed`), the model is trained once per lr in `--lr-grid` on the
+train set, and the lr that maximises the **val Hit-in-top-K** metric
+is kept. The test split is **not** touched here — its names are
+written into the ckpt for `examples/03_evaluate.py` to pick up.
 
 ```bash
-uv run python examples/02_train.py                              # default: 1KXQ, 200 epochs
-uv run python examples/02_train.py --epochs 30 --device cuda    # GPU smoke
-uv run python examples/02_train.py --proteins 1KXQ 1F51 2VDB    # after F-2 adds HDF5 refs
-```
-
-Runs `zdock.train.train` over the given proteins and saves:
-
-- `out/trained_params.pt` — dict with `alpha`, `beta`, `iface`, `charge`,
-  `history`, `proteins`
-- `out/02_loss_curve.png` — epoch-vs-loss plot (log y)
-
-**Extending the dataset:** add one line per new protein to `DATASETS`
-in `examples/_data.py` mapping the ID to its phase5 HDF5 path. Both
-`02_train.py` and `03_evaluate.py` pick it up automatically — the
-scripts never need to change.
-
-### (3) Before / after evaluation — `examples/03_evaluate.py`
-
-```bash
-uv run python examples/03_evaluate.py --params out/trained_params.pt
-# After F-3 test-set refs exist:
-# uv run python examples/03_evaluate.py --params out/trained_params.pt --proteins 1CGI 1ZHI
-```
-
-Scores each protein's poses twice — with the untrained defaults and
-with the `.pt` parameters — and reports per-protein Hit/Miss mean
-scores, ΔScore, and the best (1-based) rank of any Hit pose.
-Also writes `out/03_before_after.png` (before-vs-after scatter,
-Hits coloured, `y = x` diagonal for reference).
-
-With only `1KXQ` currently available and a synthetic `hit_mask`
-(first 3 poses labelled Hit, matching the convention in
-`tests/test_phase7_train.py`), this is a minimal but structurally
-complete evaluation. The same script will scale to the full
-benchmark once F-2 / F-3 HDF5 refs are added.
-
-### (4) Train + evaluate on the BM4 dataset — `examples/04_train_on_bm4.py`
-
-Once `datasets/bm4_full.h5` exists (see **Training on the BM4 dataset**
-below), this script is the one-command entry point for students.
-Proteins are split 70 % train / 30 % test (deterministic per `--seed`),
-the model trains on the train set, and ranking quality is reported on
-both sets.
-
-```bash
-# Defaults: 10 proteins, top-100 poses, 50 epochs (~under a minute)
-uv run python examples/04_train_on_bm4.py
+# Defaults: 10 proteins, top-100 poses, 50 epochs, lr grid {0.003,0.01,0.03}
+uv run python examples/02_train.py
 
 # Full dataset (129 proteins × top-2000 poses) on MPS / CUDA
-uv run python examples/04_train_on_bm4.py --n-proteins all --top-k 2000 --device mps
+uv run python examples/02_train.py --n-proteins all --top-k 2000 --device mps
 
-# Tweak anything you want:
-uv run python examples/04_train_on_bm4.py \
-    --n-proteins 30 --top-k 500 --epochs 100 --split 0.7 --seed 123
+# Custom split + lr grid + seed:
+uv run python examples/02_train.py \
+    --n-proteins 30 --top-k 500 --epochs 100 \
+    --train-split 0.7 --val-split 0.15 \
+    --lr-grid 0.001,0.003,0.01,0.03 --seed 123
 ```
 
 The two knobs students use most:
@@ -525,11 +507,40 @@ The two knobs students use most:
 | `--n-proteins` | how many proteins from the 129 available | 10 |
 | `--top-k` | how many top-ranked ZDOCK poses per protein | 100 |
 
-Other flags: `--split` (train fraction), `--seed`, `--epochs`, `--lr`,
-`--device`, `--top-k-eval` (Hit-in-top-K metric width).
+Other flags: `--train-split`, `--val-split` (test = 1 − train − val),
+`--seed`, `--epochs`, `--lr-grid`, `--device`, `--top-k-eval`
+(Hit-in-top-K metric width).
 
-Output: `out/trained_params_bm4.pt` with the learned parameters,
-history, and the exact train/test split used.
+Output: `out/trained_params.pt` with the learned parameters, loss
+history, the selected lr, the full grid results, and the exact
+`train_proteins` / `val_proteins` / `test_proteins` split used.
+
+### (3) Evaluate the held-out test split — `examples/03_evaluate.py`
+
+Reads the ckpt from (2), pulls out `test_proteins` (and the `h5`,
+`top_k` recorded at train time), reloads those proteins, and compares
+**before** (default params) vs **after** (ckpt params) per-protein:
+
+- Hit / Miss mean score
+- Hit-in-top-K
+- best (1-based) rank of any Hit pose
+- ΔScore (Hit, Miss)
+
+Plus a pooled before-vs-after scatter at `out/03_before_after.png`.
+
+```bash
+# Default: evaluate the ckpt at out/trained_params.pt on its test split
+uv run python examples/03_evaluate.py
+
+# Evaluate on the val split instead (useful when sanity-checking the lr pick):
+uv run python examples/03_evaluate.py --split val
+
+# Different ckpt / different HDF5 location:
+uv run python examples/03_evaluate.py --params out/my_ckpt.pt --h5 datasets/bm4_full.h5
+```
+
+The script is read-only: running it many times on the same ckpt is
+cheap and deterministic.
 
 ## Timing on 1KXQ, 10 poses, α=0.01, β=3.0
 
@@ -539,7 +550,7 @@ history, and the exact train/test split used.
 | `docking_score_elec` forward / pose | ≈ 10 ms | ≈ 70 ms | MPS launch overhead dominates |
 | `docking_score_elec` backward / pose | ≈ 18 ms | ≈ 100 ms | autograd |
 | 200-epoch training (1KXQ, 10 poses) | ≈ 13 s | ≈ 40 s | loss drops ~78% |
-| Full pytest suite | ≈ 18 s | ≈ 35 s | 24 tests |
+| Full pytest suite | ≈ 18 s | ≈ 35 s | 58 tests |
 
 MPS gains relative to CPU scale with F. At F=100 on a CUDA A100, expect
 50–100× speedup over single-core CPU.
@@ -616,8 +627,10 @@ IFACE grouping conventions (see B9 in `PORT_PLAN.md`) is easy to break.
 - **Parent project**: `../docking/` — Julia version, master thesis, full plan
 - **Port plan**: `../docking/PORT_PLAN.md` — bug list B1–B15 and rationale
 - **Follow-up tasks** (not required for basic use):
-  [FOLLOWUPS.md](FOLLOWUPS.md) — F-1 CHARMM19 charges, F-2 full 3-protein
-  training, F-3 test-protein Rank evaluation, F-4 `torch.compile`.
+  [FOLLOWUPS.md](FOLLOWUPS.md) — F-1 CHARMM19 charges, F-4
+  `torch.compile`, …  (F-2 multi-protein training and F-3 test-set
+  evaluation are now covered by `examples/02_train.py` /
+  `examples/03_evaluate.py` on BM4.)
 - **B4 physics note**: `../docking/tests/julia_ref/b4_physics_report.md`
   (Σq/Σr vs Σq/r) — superseded by the Phase C section of PORT_PLAN.md
 - **Julia reference tests**: `../docking/tests/julia_ref/README.md`

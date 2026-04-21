@@ -69,7 +69,7 @@ def load_training_dataset(
             the full 54,000-pose trajectory never reaches device memory.
             Poses in the h5 are stored in ZDOCK raw-score order (highest
             first), so `max_poses=K` is identical to taking the ZDOCK
-            top-K — the same semantics as `examples/04_train_on_bm4.py:
+            top-K — the same semantics as `examples/02_train.py:
             cap_poses`. `None` (default) reads every pose.
 
     Returns:

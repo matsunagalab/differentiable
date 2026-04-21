@@ -1,5 +1,9 @@
-"""Adam training loop for the 157 scoring parameters (α, β, iface_flat,
-charge_score), with B2 loss-function bug fixed.
+"""Adam training loop for the 156 learnable scoring parameters (α,
+iface_flat, charge_score), with B2 loss-function bug fixed. β is held
+fixed at 3.0 because `score_elec` is linear (coulomb mode) or quadratic
+(legacy mode) in `charge_score`, so any β can be absorbed into an
+overall scaling of `charge_score` — training β separately just adds a
+scale-redundant degree of freedom that worsens Adam dynamics.
 
 The Julia notebook (cell 62) wrote the loss as:
 
@@ -161,7 +165,7 @@ def train(
     # Initial parameters — same as Julia `train_param-apart.ipynb` cell
     # 27-28 defaults.
     alpha = torch.tensor(0.01, device=device, dtype=dtype, requires_grad=True)
-    beta = torch.tensor(3.0, device=device, dtype=dtype, requires_grad=True)
+    beta = torch.tensor(3.0, device=device, dtype=dtype)
     iface_init = iface_ij(device=device, dtype=dtype, flat=True).clone()
     iface = iface_init.detach().requires_grad_(True)
     charge_init = default_charge_score(device=device, dtype=dtype).clone()
@@ -174,7 +178,7 @@ def train(
             s0 = p.call(alpha, iface, beta, charge, frame_chunk_size=frame_chunk_size)
             targets.append(make_ideal_targets(s0, p.hit_mask))
 
-    opt = torch.optim.Adam([alpha, beta, iface, charge], lr=lr)
+    opt = torch.optim.Adam([alpha, iface, charge], lr=lr)
     history = {"loss": []}
 
     for epoch in range(n_epoch):
@@ -192,7 +196,6 @@ def train(
 
     return {
         "alpha": alpha.detach(),
-        "beta": beta.detach(),
         "iface": iface.detach(),
         "charge": charge.detach(),
         "history": history,

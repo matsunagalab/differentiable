@@ -74,7 +74,6 @@ def test_train_smoke_loss_decreases(load_ref, device, dtype):
     )
     assert hist[-1] < hist[0] * 0.95
     assert not torch.allclose(out["alpha"], torch.tensor(0.01, device=device, dtype=dtype))
-    assert not torch.allclose(out["beta"], torch.tensor(3.0, device=device, dtype=dtype))
 
 
 def test_frame_chunking_matches_unchunked(load_ref, device, dtype):
@@ -126,8 +125,8 @@ def test_train_200_epoch_1kxq(load_ref, device, dtype):
     """Full 200-epoch training on 1KXQ alone (matching thesis schedule).
 
     Run with `pytest -m slow` to opt in. Proves loss continues to descend
-    across the full 200 epochs and parameters land near physically-plausible
-    values (α ~ 0.01, β ~ 3, iface still bounded)."""
+    across the full 200 epochs and α lands near a physically-plausible
+    value (α ~ 0.01). β is held fixed at 3.0 by `train()`."""
     p = build_1kxq(load_ref, device, dtype)
     out = train([p], n_epoch=200, lr=0.01, device=device, dtype=dtype,
                 progress_every=25)
@@ -135,10 +134,8 @@ def test_train_200_epoch_1kxq(load_ref, device, dtype):
     print(f"\n[train-200] initial={hist[0]:.4e}  final={hist[-1]:.4e}  "
           f"reduction={(hist[0]-hist[-1])/hist[0]*100:.1f}%")
     assert hist[-1] < hist[0] * 0.5   # expect ≥50% drop after 200 epochs
-    # Parameter sanity
-    print(f"[train-200] α = {out['alpha'].item():.4e}  β = {out['beta'].item():.4e}")
+    print(f"[train-200] α = {out['alpha'].item():.4e}")
     assert abs(out["alpha"]) < 1.0, "α drifted out of plausible range"
-    assert abs(out["beta"]) < 10.0, "β drifted out of plausible range"
 
 
 # ---------------------------------------------------------- input-validation
