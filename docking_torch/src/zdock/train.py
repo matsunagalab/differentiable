@@ -101,6 +101,35 @@ def loss_b2_fixed(
     return hit_term + miss_term
 
 
+def loss_listnet(
+    scores: torch.Tensor,
+    rmsd: torch.Tensor,
+    *,
+    temperature: float = 5.0,
+) -> torch.Tensor:
+    """ListNet listwise cross-entropy ranking loss: push the score
+    ranking to match the ideal ranking induced by ascending RMSD.
+
+        target_i = softmax(-rmsd / T)_i     # low RMSD -> high target prob
+        pred_i   = softmax(scores)_i
+        loss     = -sum_i target_i * log pred_i
+
+    Temperature T (in Å) controls target peakedness: T -> 0 concentrates
+    mass on the single lowest-RMSD pose (sparse gradient); T -> infty
+    approaches uniform. Default 5.0 Å gives a reasonable spread across
+    the BM4 top-K RMSD range (~2-30 Å).
+
+    Unlike `loss_b2_fixed`, this uses the raw RMSD values directly and
+    does not depend on a Hit/Miss threshold — continuous ordering
+    information within each class is preserved.
+    """
+    if rmsd.numel() == 0:
+        return torch.zeros((), device=scores.device, dtype=scores.dtype)
+    target = torch.softmax(-rmsd / temperature, dim=0)
+    log_pred = torch.log_softmax(scores, dim=0)
+    return -(target * log_pred).sum()
+
+
 def total_loss(
     proteins: Iterable[ProteinInputs],
     alpha: torch.Tensor,
@@ -126,6 +155,9 @@ def total_loss(
     return torch.stack(parts).sum()
 
 
+_VALID_LOSSES = ("split_mse", "rank")
+
+
 def train(
     proteins: list[ProteinInputs],
     *,
@@ -136,10 +168,19 @@ def train(
     progress_every: int = 10,
     log: Callable[[str], None] = print,
     frame_chunk_size: int | None = None,
+    loss: str = "split_mse",
+    listnet_temperature: float = 5.0,
 ) -> dict:
     """Run the full Adam optimization and return the trained parameters
-    plus a loss history. Targets are frozen at their pre-training values
-    (the "ideal score distribution" scheme).
+    plus a loss history.
+
+    `loss` selects the per-protein objective:
+      - "split_mse" (default): the Julia `loss_b2_fixed` — Hit poses
+        pulled to max(initial_scores), Miss poses to min. Targets are
+        frozen at pre-training values.
+      - "rank": ListNet on RMSD — `loss_listnet(scores, rmsd,
+        temperature=listnet_temperature)`. Requires every protein to
+        carry `rmsd`; raises ValueError otherwise.
 
     The per-epoch loss is the sum of per-protein losses. We compute + run
     backward *per protein* so only one protein's autograd graph lives at
@@ -152,9 +193,8 @@ def train(
     per-frame (F) memory also stays bounded — see that function's
     docstring.
 
-    Raises ValueError if `progress_every <= 0` or `proteins` is empty —
-    both were previously silent failures (ZeroDivisionError / opaque
-    RuntimeError from torch.stack).
+    Raises ValueError if `progress_every <= 0`, `proteins` is empty, or
+    `loss` is unknown.
     """
     if progress_every <= 0:
         raise ValueError(
@@ -162,6 +202,17 @@ def train(
         )
     if len(proteins) == 0:
         raise ValueError("train requires at least one protein; got an empty list")
+    if loss not in _VALID_LOSSES:
+        raise ValueError(
+            f"unknown loss {loss!r}; must be one of {_VALID_LOSSES}"
+        )
+    if loss == "rank":
+        for i, p in enumerate(proteins):
+            if p.rmsd is None:
+                raise ValueError(
+                    f"loss='rank' requires rmsd on every protein, but "
+                    f"proteins[{i}] has rmsd=None"
+                )
     # Initial parameters — same as Julia `train_param-apart.ipynb` cell
     # 27-28 defaults.
     alpha = torch.tensor(0.01, device=device, dtype=dtype, requires_grad=True)
@@ -171,12 +222,19 @@ def train(
     charge_init = default_charge_score(device=device, dtype=dtype).clone()
     charge = charge_init.detach().requires_grad_(True)
 
-    # Freeze "ideal" targets from pre-training scores.
-    with torch.no_grad():
-        targets = []
-        for p in proteins:
-            s0 = p.call(alpha, iface, beta, charge, frame_chunk_size=frame_chunk_size)
-            targets.append(make_ideal_targets(s0, p.hit_mask))
+    # split_mse freezes per-protein targets from pre-training scores;
+    # rank doesn't use targets at all.
+    if loss == "split_mse":
+        with torch.no_grad():
+            targets = []
+            for p in proteins:
+                s0 = p.call(
+                    alpha, iface, beta, charge,
+                    frame_chunk_size=frame_chunk_size,
+                )
+                targets.append(make_ideal_targets(s0, p.hit_mask))
+    else:
+        targets = [None] * len(proteins)
 
     opt = torch.optim.Adam([alpha, iface, charge], lr=lr)
     history = {"loss": []}
@@ -184,9 +242,18 @@ def train(
     for epoch in range(n_epoch):
         opt.zero_grad()
         epoch_loss = 0.0
-        for p, (ht, mt) in zip(proteins, targets):
-            scores = p.call(alpha, iface, beta, charge, frame_chunk_size=frame_chunk_size)
-            lp = loss_b2_fixed(scores, p.hit_mask, ht, mt)
+        for p, tgt in zip(proteins, targets):
+            scores = p.call(
+                alpha, iface, beta, charge,
+                frame_chunk_size=frame_chunk_size,
+            )
+            if loss == "rank":
+                lp = loss_listnet(
+                    scores, p.rmsd, temperature=listnet_temperature,
+                )
+            else:
+                ht, mt = tgt
+                lp = loss_b2_fixed(scores, p.hit_mask, ht, mt)
             lp.backward()
             epoch_loss += float(lp.detach())
         opt.step()

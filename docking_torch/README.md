@@ -156,6 +156,16 @@ The Julia notebook had a bug (B2) that silently dropped five of the
 six MSE terms; the port fixes this, so all protein contributions
 actually affect the gradient.
 
+Two training objectives are available via `train(..., loss=...)`:
+
+- **`"split_mse"`** (default): the Hit/Miss per-class MSE described
+  above — matches the Julia reference.
+- **`"rank"`**: **ListNet** listwise cross-entropy on RMSD —
+  `-Σ softmax(-rmsd / T) · log softmax(scores)`. Uses the raw RMSD
+  values directly (no Hit/Miss threshold), so continuous ordering is
+  preserved. `T` (Å, `listnet_temperature`, default 5.0) controls
+  target peakedness. Requires `rmsd` on every `ProteinInputs`.
+
 ## Quick start
 
 Requires [uv](https://docs.astral.sh/uv/).
@@ -322,10 +332,15 @@ p = ProteinInputs(
 out = train([p], n_epoch=200, lr=0.01, device="mps", dtype=torch.float32)
 print("final loss:", out["history"]["loss"][-1])
 print("optimized α:", out["alpha"].item(), "  (β fixed at 3.0)")
+
+# Rank-based alternative (ListNet on RMSD — requires p.rmsd):
+out = train([p], n_epoch=200, lr=0.01, loss="rank", listnet_temperature=5.0)
 ```
 
-The loss is the B2-fixed 6-term MSE (all terms contribute; the Julia
-notebook's newline-continuation bug silently dropped five of them).
+The default loss is the B2-fixed 6-term MSE (all terms contribute;
+the Julia notebook's newline-continuation bug silently dropped five
+of them). Pass `loss="rank"` for the ListNet objective on RMSD — see
+§ *Differentiability and training* above.
 
 For the end-to-end dataset workflow (load BM4 → 70/15/15 split → lr
 grid search on val → evaluate test), use `examples/02_train.py` and
@@ -498,6 +513,9 @@ uv run python examples/02_train.py \
     --n-proteins 30 --top-k 500 --epochs 100 \
     --train-split 0.7 --val-split 0.15 \
     --lr-grid 0.001,0.003,0.01,0.03 --seed 123
+
+# Rank-based (ListNet on RMSD) instead of Hit/Miss split-MSE:
+uv run python examples/02_train.py --loss rank --listnet-temperature 5.0
 ```
 
 The two knobs students use most:
@@ -509,7 +527,11 @@ The two knobs students use most:
 
 Other flags: `--train-split`, `--val-split` (test = 1 − train − val),
 `--seed`, `--epochs`, `--lr-grid`, `--device`, `--top-k-eval`
-(Hit-in-top-K metric width).
+(Hit-in-top-K metric width), `--loss {split_mse,rank}` (training
+objective — see § *Differentiability and training*),
+`--listnet-temperature` (ListNet target softmax temperature T in Å;
+only used when `--loss rank`; default 5.0 — sweep
+`{1.0, 3.0, 10.0}` to see how peakedness affects val Hit-in-top-K).
 
 Output: `out/trained_params.pt` with the learned parameters, loss
 history, the selected lr, the full grid results, and the exact

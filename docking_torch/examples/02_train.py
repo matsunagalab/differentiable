@@ -183,6 +183,15 @@ def main() -> None:
                     help="comma-separated learning rates to sweep; the lr with "
                          "the highest val Hit-in-top-K is kept (default "
                          "'0.003,0.01,0.03')")
+    ap.add_argument("--loss", choices=["split_mse", "rank"], default="split_mse",
+                    help="training objective: 'split_mse' (Julia default, "
+                         "Hit/Miss MSE) or 'rank' (ListNet on RMSD). "
+                         "Default 'split_mse'.")
+    ap.add_argument("--listnet-temperature", type=float, default=5.0,
+                    help="temperature T (Å) for ListNet target "
+                         "softmax(-rmsd/T); only used when --loss rank. "
+                         "Smaller T = more peaked on the best pose; larger "
+                         "T = smoother. Default 5.0.")
     ap.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
     ap.add_argument("--top-k-eval", type=int, default=10,
                     help="rank metric: Hit count in top-K-eval (default 10)")
@@ -206,7 +215,11 @@ def main() -> None:
 
     device = resolve_device(args.device)
     dtype = default_dtype(device)
-    print(f"device={device}  dtype={dtype}  lr_grid={lr_grid}")
+    loss_desc = (
+        f"rank (ListNet, T={args.listnet_temperature} Å)"
+        if args.loss == "rank" else "split_mse"
+    )
+    print(f"device={device}  dtype={dtype}  lr_grid={lr_grid}  loss={loss_desc}")
 
     # 1. Pick subset of proteins.
     all_names = list_proteins(args.h5)
@@ -266,6 +279,8 @@ def main() -> None:
             dtype=dtype,
             progress_every=max(1, args.epochs // 5),
             frame_chunk_size=frame_chunk_size,
+            loss=args.loss,
+            listnet_temperature=args.listnet_temperature,
         )
         val_metric = total_hits_in_top_k(
             val_proteins,
@@ -333,6 +348,8 @@ def main() -> None:
             "top_k_eval": args.top_k_eval,
             "seed": args.seed,
             "epochs": args.epochs,
+            "loss": args.loss,
+            "listnet_temperature": args.listnet_temperature,
             "h5": str(args.h5),
         },
         args.out,
