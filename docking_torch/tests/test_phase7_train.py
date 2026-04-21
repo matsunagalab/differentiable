@@ -77,6 +77,50 @@ def test_train_smoke_loss_decreases(load_ref, device, dtype):
     assert not torch.allclose(out["beta"], torch.tensor(3.0, device=device, dtype=dtype))
 
 
+def test_frame_chunking_matches_unchunked(load_ref, device, dtype):
+    """docking_score_elec must return (bit-exact on CPU float64, close on
+    GPU float32) the same scores and parameter gradients whether we run
+    with or without frame_chunk_size. Guards the memory-saving path from
+    silent numerical drift."""
+    from zdock.atomtypes import iface_ij, charge_score as default_charge_score
+    from zdock.score import docking_score_elec
+
+    p = build_1kxq(load_ref, device, dtype)
+
+    alpha = torch.tensor(0.01, device=device, dtype=dtype, requires_grad=True)
+    beta = torch.tensor(3.0, device=device, dtype=dtype, requires_grad=True)
+    iface = iface_ij(device=device, dtype=dtype, flat=True).clone().detach().requires_grad_(True)
+    charge = default_charge_score(device=device, dtype=dtype).clone().detach().requires_grad_(True)
+
+    def run(chunk):
+        return docking_score_elec(
+            p.rec_xyz, p.rec_radius, p.rec_sasa, p.rec_atomtype_id, p.rec_charge_id,
+            p.lig_xyz, p.lig_radius, p.lig_sasa, p.lig_atomtype_id, p.lig_charge_id,
+            alpha, iface, beta, charge,
+            frame_chunk_size=chunk,
+        )
+
+    s_full = run(None)
+    s_chunk = run(3)
+
+    # CPU float64 is bit-exact; float32 scatter_add is non-associative so
+    # chunking changes the reduction order and we need small tolerance.
+    if dtype == torch.float64:
+        atol, rtol = 1e-10, 0.0
+    else:
+        atol, rtol = 1e-4, 1e-5
+    assert torch.allclose(s_full, s_chunk, atol=atol, rtol=rtol), (
+        f"score mismatch: max |diff|={(s_full - s_chunk).abs().max().item():.3e}"
+    )
+
+    g_full = torch.autograd.grad(s_full.sum(), (alpha, iface, beta, charge), retain_graph=True)
+    g_chunk = torch.autograd.grad(s_chunk.sum(), (alpha, iface, beta, charge))
+    for name, a, b in zip(("alpha", "iface", "beta", "charge"), g_full, g_chunk):
+        assert torch.allclose(a, b, atol=atol, rtol=rtol), (
+            f"grad[{name}] mismatch: max |diff|={(a - b).abs().max().item():.3e}"
+        )
+
+
 @pytest.mark.slow
 def test_train_200_epoch_1kxq(load_ref, device, dtype):
     """Full 200-epoch training on 1KXQ alone (matching thesis schedule).

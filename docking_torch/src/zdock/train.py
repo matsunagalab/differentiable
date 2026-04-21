@@ -49,6 +49,8 @@ class ProteinInputs:
         iface: torch.Tensor,
         beta: torch.Tensor,
         charge: torch.Tensor,
+        *,
+        frame_chunk_size: int | None = None,
     ) -> torch.Tensor:
         return docking_score_elec(
             self.rec_xyz, self.rec_radius, self.rec_sasa,
@@ -56,6 +58,7 @@ class ProteinInputs:
             self.lig_xyz, self.lig_radius, self.lig_sasa,
             self.lig_atomtype_id, self.lig_charge_id,
             alpha, iface, beta, charge,
+            frame_chunk_size=frame_chunk_size,
         )
 
 
@@ -128,10 +131,22 @@ def train(
     dtype: torch.dtype = torch.float64,
     progress_every: int = 10,
     log: Callable[[str], None] = print,
+    frame_chunk_size: int | None = None,
 ) -> dict:
     """Run the full Adam optimization and return the trained parameters
     plus a loss history. Targets are frozen at their pre-training values
     (the "ideal score distribution" scheme).
+
+    The per-epoch loss is the sum of per-protein losses. We compute + run
+    backward *per protein* so only one protein's autograd graph lives at
+    a time (the Adam step still sees the sum of all per-protein gradients,
+    which is mathematically identical to `sum(...).backward()`). This
+    keeps peak VRAM from scaling with the number of proteins in the
+    training list.
+
+    `frame_chunk_size` is forwarded into `docking_score_elec` so the
+    per-frame (F) memory also stays bounded — see that function's
+    docstring.
 
     Raises ValueError if `progress_every <= 0` or `proteins` is empty —
     both were previously silent failures (ZeroDivisionError / opaque
@@ -156,7 +171,7 @@ def train(
     with torch.no_grad():
         targets = []
         for p in proteins:
-            s0 = p.call(alpha, iface, beta, charge)
+            s0 = p.call(alpha, iface, beta, charge, frame_chunk_size=frame_chunk_size)
             targets.append(make_ideal_targets(s0, p.hit_mask))
 
     opt = torch.optim.Adam([alpha, beta, iface, charge], lr=lr)
@@ -164,12 +179,16 @@ def train(
 
     for epoch in range(n_epoch):
         opt.zero_grad()
-        l = total_loss(proteins, alpha, iface, beta, charge, targets)
-        l.backward()
+        epoch_loss = 0.0
+        for p, (ht, mt) in zip(proteins, targets):
+            scores = p.call(alpha, iface, beta, charge, frame_chunk_size=frame_chunk_size)
+            lp = loss_b2_fixed(scores, p.hit_mask, ht, mt)
+            lp.backward()
+            epoch_loss += float(lp.detach())
         opt.step()
-        history["loss"].append(float(l.detach()))
+        history["loss"].append(epoch_loss)
         if epoch % progress_every == 0 or epoch == n_epoch - 1:
-            log(f"epoch {epoch:4d}  loss={float(l.detach()):.6e}")
+            log(f"epoch {epoch:4d}  loss={epoch_loss:.6e}")
 
     return {
         "alpha": alpha.detach(),

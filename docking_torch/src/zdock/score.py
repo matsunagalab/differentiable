@@ -39,6 +39,7 @@ from __future__ import annotations
 import math
 
 import torch
+from torch.utils.checkpoint import checkpoint
 
 from typing import Literal
 
@@ -210,6 +211,153 @@ def _assign_sc_minus(
 # ---------------------------------------------------------------------------
 
 
+def _score_ligand_chunk(
+    lig_xyz: torch.Tensor,                     # (F_c, N_lig, 3)
+    alpha: torch.Tensor,
+    iface_matrix: torch.Tensor,                # (12, 12)
+    beta: torch.Tensor,
+    charge_score: torch.Tensor,                # (11,)
+    H: torch.Tensor,                           # (12, nx, ny, nz)
+    rec_sc_real: torch.Tensor,                 # (nx, ny, nz)
+    rec_sc_imag: torch.Tensor,                 # (nx, ny, nz)
+    V_rec_or_U: torch.Tensor,                  # (nx, ny, nz) if coulomb; (11, nx, ny, nz) if legacy
+    *,
+    lig_radius: torch.Tensor,
+    lig_sasa: torch.Tensor,
+    lig_atomtype_id: torch.Tensor,
+    lig_charge_id: torch.Tensor,
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    z_grid: torch.Tensor,
+    surface_threshold: float,
+    elec_mode: ElecMode,
+) -> torch.Tensor:
+    """Per-frame total scores for a single ligand frame-chunk, re-using
+    precomputed receptor grids.
+
+    Split out of `docking_score_elec` so that callers can loop over
+    chunks of F and optionally wrap each call in
+    `torch.utils.checkpoint.checkpoint` to keep peak VRAM from scaling
+    with F (instead it scales with F_chunk). Receptor grids — which do
+    not depend on F — are computed once in the parent and passed in.
+    """
+    device = lig_xyz.device
+    dtype = lig_xyz.dtype
+    F = lig_xyz.shape[0]
+    N_lig = lig_xyz.shape[1]
+    nx, ny, nz = rec_sc_real.shape
+    V = nx * ny * nz
+
+    lig_group_iface = (lig_atomtype_id - 1).to(torch.long).clamp(0, 11)
+    lig_in_charge = (lig_atomtype_id >= 1) & (lig_atomtype_id <= 11)
+    lig_group_charge = torch.where(
+        lig_in_charge, lig_atomtype_id - 1, torch.full_like(lig_atomtype_id, -1)
+    ).to(torch.long)
+    lig_surf = lig_sasa > surface_threshold
+
+    frame_arange = torch.arange(F, device=device)
+    lig_surf_expanded = lig_surf.unsqueeze(0).expand(F, -1)
+    lig_radius_expanded = lig_radius.unsqueeze(0).expand(F, -1)
+
+    frame_idx_per_atom = frame_arange.unsqueeze(-1).expand(-1, N_lig).reshape(-1)
+    lxyz_flat = lig_xyz.reshape(-1, 3)
+    lig_radius_flat = lig_radius_expanded.reshape(-1)
+    lig_group_iface_flat = lig_group_iface.unsqueeze(0).expand(F, -1).reshape(-1)
+    lig_surf_flat = lig_surf_expanded.reshape(-1)
+    lig_group_charge_flat = lig_group_charge.unsqueeze(0).expand(F, -1).reshape(-1)
+
+    def sc_union(xyz_f, group_frame, rcut_f, grid_shape):
+        cnt = torch.zeros(grid_shape, device=device, dtype=dtype)
+        _grouped_spread_neighbors_add(
+            cnt, xyz_f, group_frame,
+            torch.ones(xyz_f.shape[0], device=device, dtype=dtype),
+            rcut_f, x_grid, y_grid, z_grid,
+        )
+        return (cnt > 0).to(dtype)
+
+    surf_mask_flat = lig_surf_flat
+    core_mask_flat = ~lig_surf_flat
+
+    lig_sc_real = torch.zeros((F, nx, ny, nz), device=device, dtype=dtype)
+    surf_idx = surf_mask_flat.nonzero(as_tuple=True)[0]
+    if surf_idx.numel() > 0:
+        layer1 = sc_union(
+            lxyz_flat[surf_idx],
+            frame_idx_per_atom[surf_idx], lig_radius_flat[surf_idx],
+            (F, nx, ny, nz),
+        )
+        lig_sc_real = torch.maximum(lig_sc_real, layer1)
+    core_idx = core_mask_flat.nonzero(as_tuple=True)[0]
+    if core_idx.numel() > 0:
+        layer2 = sc_union(
+            lxyz_flat[core_idx],
+            frame_idx_per_atom[core_idx], lig_radius_flat[core_idx] * math.sqrt(1.5),
+            (F, nx, ny, nz),
+        )
+        lig_sc_real = torch.maximum(lig_sc_real, layer2)
+
+    lig_sc_imag = torch.zeros((F, nx, ny, nz), device=device, dtype=dtype)
+    if surf_idx.numel() > 0:
+        lay1 = sc_union(
+            lxyz_flat[surf_idx],
+            frame_idx_per_atom[surf_idx], lig_radius_flat[surf_idx],
+            (F, nx, ny, nz),
+        )
+        lig_sc_imag = torch.where(lay1 > 0, lay1 * 3.5, lig_sc_imag)
+    if core_idx.numel() > 0:
+        lay2 = sc_union(
+            lxyz_flat[core_idx],
+            frame_idx_per_atom[core_idx], lig_radius_flat[core_idx] * math.sqrt(1.5),
+            (F, nx, ny, nz),
+        )
+        lig_sc_imag = torch.where(lay2 > 0, lay2 * 12.25, lig_sc_imag)
+
+    multi_real = rec_sc_real.unsqueeze(0) * lig_sc_real - rec_sc_imag.unsqueeze(0) * lig_sc_imag
+    multi_imag = rec_sc_real.unsqueeze(0) * lig_sc_imag + rec_sc_imag.unsqueeze(0) * lig_sc_real
+    score_sc = multi_real.reshape(F, -1).sum(-1) - multi_imag.reshape(F, -1).sum(-1)
+
+    L_count = torch.zeros((F * 12, nx, ny, nz), device=device, dtype=dtype)
+    group_f12 = frame_idx_per_atom * 12 + lig_group_iface_flat
+    _grouped_spread_nearest_add(
+        L_count, lxyz_flat, group_f12,
+        torch.ones(lxyz_flat.shape[0], device=device, dtype=dtype),
+        x_grid, y_grid, z_grid,
+    )
+    L = (L_count.view(F, 12, nx, ny, nz) > 0).to(dtype)
+    T = torch.einsum("fiv,jv->fij", L.reshape(F, 12, V), H.reshape(12, V))
+    score_iface = (iface_matrix.unsqueeze(0) * T).reshape(F, -1).sum(-1)
+
+    if elec_mode == "coulomb":
+        V_rec = V_rec_or_U
+        lig_partial_q = partial_charge_per_atom(lig_charge_id, charge_score)
+        lig_partial_q_flat = lig_partial_q.unsqueeze(0).expand(F, -1).reshape(-1)
+        Q_L_flat = torch.zeros(F * nx * ny * nz, device=device, dtype=dtype)
+        _grouped_spread_nearest_add(
+            Q_L_flat.view(F, nx, ny, nz),
+            lxyz_flat, frame_idx_per_atom, lig_partial_q_flat,
+            x_grid, y_grid, z_grid,
+        )
+        Q_L = Q_L_flat.view(F, nx, ny, nz)
+        score_elec = (V_rec.unsqueeze(0) * Q_L).reshape(F, -1).sum(-1)
+    else:  # elec_mode == "legacy"
+        U = V_rec_or_U
+        valid_flat = lig_group_charge_flat >= 0
+        grp_f11 = frame_idx_per_atom * 11 + lig_group_charge_flat.clamp(min=0)
+        grp_f11 = grp_f11[valid_flat]
+        xyz_c_flat = lxyz_flat[valid_flat]
+        V_count = torch.zeros((F * 11, nx, ny, nz), device=device, dtype=dtype)
+        _grouped_spread_nearest_add(
+            V_count, xyz_c_flat, grp_f11,
+            torch.ones(xyz_c_flat.shape[0], device=device, dtype=dtype),
+            x_grid, y_grid, z_grid,
+        )
+        V_grid = V_count.view(F, 11, nx, ny, nz)
+        c = (V_grid.reshape(F, 11, V) * U.reshape(11, V).unsqueeze(0)).sum(-1)
+        score_elec = (charge_score.pow(2).unsqueeze(0) * c).sum(-1)
+
+    return alpha * score_sc + score_iface + beta * score_elec
+
+
 def docking_score_elec(
     rec_xyz: torch.Tensor,              # (N_rec, 3) — already decentered
     rec_radius: torch.Tensor,           # (N_rec,)
@@ -232,6 +380,7 @@ def docking_score_elec(
     rcut_elec: float = 8.0,
     surface_threshold: float = 1.0,
     elec_mode: ElecMode = "coulomb",
+    frame_chunk_size: int | None = None,
 ) -> torch.Tensor:
     """Return a (F,) tensor of docking scores.
 
@@ -247,6 +396,13 @@ def docking_score_elec(
     bit-exact reproduction of the master thesis numbers.
 
     SC + IFACE are unchanged between modes (they have no ELEC-specific bugs).
+
+    `frame_chunk_size`: if set to a positive int smaller than F, the
+    ligand-side forward is split into chunks of that size and each chunk
+    is wrapped in `torch.utils.checkpoint.checkpoint` when gradients are
+    required. Peak VRAM then scales with F_chunk instead of F, at the
+    cost of one extra forward per chunk during backward. `None` (default)
+    or `<= 0` disables chunking (original behaviour).
     """
     device = rec_xyz.device
     dtype = rec_xyz.dtype
@@ -334,157 +490,58 @@ def docking_score_elec(
         eps = torch.finfo(dtype).eps
         U = torch.where(U_den > 0, U_num / U_den.clamp(min=eps), torch.zeros_like(U_num))
 
-    # Frame-batched scoring. The loop over frames in the Julia code is the
-    # single largest source of GPU kernel launch overhead; we vectorize it
-    # away by flattening (frame, atom) into a single atom dim and routing
-    # each scatter into the correct per-frame slab with an extra frame
-    # offset in the flat index.
-    F = lig_xyz.shape[0]
-    N_lig = lig_xyz.shape[1]
-    lig_group_iface = (lig_atomtype_id - 1).to(torch.long).clamp(0, 11)
-    # Same note as above: ELEC uses atomtype_id (1..11), not charge_id.
-    lig_in_charge = (lig_atomtype_id >= 1) & (lig_atomtype_id <= 11)
-    lig_group_charge = torch.where(
-        lig_in_charge, lig_atomtype_id - 1, torch.full_like(lig_atomtype_id, -1)
-    ).to(torch.long)
-    lig_surf = lig_sasa > surface_threshold
-    V = nx * ny * nz
+    # Ligand-side processing is F-linear in memory; extracted into
+    # `_score_ligand_chunk` so that we can loop over frame chunks and
+    # optionally checkpoint each chunk. Receptor grids above are reused.
+    V_rec_or_U = V_rec if elec_mode == "coulomb" else U
 
-    # SC ligand (batched per frame). We still use the three-layer
-    # substitute spreads; rather than batching by frame here (which would
-    # require a new grouped_spread_neighbors_substitute variant) we take
-    # advantage of the fact that only 3 calls × F frames happen and pay
-    # the launch overhead once per layer for all frames together.
-    frame_arange = torch.arange(F, device=device)
-    lig_surf_expanded = lig_surf.unsqueeze(0).expand(F, -1)      # (F, N)
-    lig_radius_expanded = lig_radius.unsqueeze(0).expand(F, -1)  # (F, N)
-
-    # Flattened per-atom arrays for batched scatter across frames.
-    frame_idx_per_atom = frame_arange.unsqueeze(-1).expand(-1, N_lig).reshape(-1)
-    lxyz_flat = lig_xyz.reshape(-1, 3)
-    lig_radius_flat = lig_radius_expanded.reshape(-1)
-    lig_group_iface_flat = lig_group_iface.unsqueeze(0).expand(F, -1).reshape(-1)
-    lig_surf_flat = lig_surf_expanded.reshape(-1)
-    lig_group_charge_flat = lig_group_charge.unsqueeze(0).expand(F, -1).reshape(-1)
-
-    # --- SC ligand (complex) --------------------------------------------
-    # For the substitute path, we do one "any-within-range" union mask per
-    # layer, then overwrite. Write into a (F, nx, ny, nz) grid via
-    # _grouped_spread_neighbors_add + clip-to-1 for union; this gives a
-    # true union without relying on scatter's non-deterministic duplicate
-    # handling.
-    def sc_union(xyz_f, radii_f, group_frame, rcut_f, grid_shape):
-        """Compute (F, nx, ny, nz) grid where cell is 1 if ANY of the
-        given atoms (of each frame) has that cell within its rcut."""
-        cnt = torch.zeros(grid_shape, device=device, dtype=dtype)
-        _grouped_spread_neighbors_add(
-            cnt, xyz_f, group_frame,
-            torch.ones(xyz_f.shape[0], device=device, dtype=dtype),
-            rcut_f, x_grid, y_grid, z_grid,
-        )
-        return (cnt > 0).to(dtype)
-
-    surf_mask_flat = lig_surf_flat
-    core_mask_flat = ~lig_surf_flat
-
-    # lig_plus (real): 2 layers for ligand
-    lig_sc_real = torch.zeros((F, nx, ny, nz), device=device, dtype=dtype)
-    # layer 1 for ligand plus: surface atoms, rcut = radius
-    surf_idx = surf_mask_flat.nonzero(as_tuple=True)[0]
-    if surf_idx.numel() > 0:
-        layer1 = sc_union(
-            lxyz_flat[surf_idx], lig_radius_flat[surf_idx],
-            frame_idx_per_atom[surf_idx], lig_radius_flat[surf_idx],
-            (F, nx, ny, nz),
-        )
-        lig_sc_real = torch.maximum(lig_sc_real, layer1)
-    # layer 2: core atoms, rcut = radius * sqrt(1.5)
-    core_idx = core_mask_flat.nonzero(as_tuple=True)[0]
-    if core_idx.numel() > 0:
-        layer2 = sc_union(
-            lxyz_flat[core_idx], lig_radius_flat[core_idx],
-            frame_idx_per_atom[core_idx], lig_radius_flat[core_idx] * math.sqrt(1.5),
-            (F, nx, ny, nz),
-        )
-        lig_sc_real = torch.maximum(lig_sc_real, layer2)
-
-    # lig_minus (imag): 2 layers with weights 3.5 and 12.25
-    lig_sc_imag = torch.zeros((F, nx, ny, nz), device=device, dtype=dtype)
-    if surf_idx.numel() > 0:
-        # Ligand minus does NOT apply the +3.4 pad (receptor-only in _assign_sc_minus).
-        # First layer: surface, rcut = radius, weight 3.5
-        lay1 = sc_union(
-            lxyz_flat[surf_idx], lig_radius_flat[surf_idx],
-            frame_idx_per_atom[surf_idx], lig_radius_flat[surf_idx],
-            (F, nx, ny, nz),
-        )
-        lig_sc_imag = torch.where(lay1 > 0, lay1 * 3.5, lig_sc_imag)
-    if core_idx.numel() > 0:
-        lay2 = sc_union(
-            lxyz_flat[core_idx], lig_radius_flat[core_idx],
-            frame_idx_per_atom[core_idx], lig_radius_flat[core_idx] * math.sqrt(1.5),
-            (F, nx, ny, nz),
-        )
-        lig_sc_imag = torch.where(lay2 > 0, lay2 * 12.25, lig_sc_imag)
-
-    # Complex SC product per frame and reduce: score_sc[f] = Σ (real − imag)
-    multi_real = rec_sc_real.unsqueeze(0) * lig_sc_real - rec_sc_imag.unsqueeze(0) * lig_sc_imag
-    multi_imag = rec_sc_real.unsqueeze(0) * lig_sc_imag + rec_sc_imag.unsqueeze(0) * lig_sc_real
-    score_sc = multi_real.reshape(F, -1).sum(-1) - multi_imag.reshape(F, -1).sum(-1)
-
-    # --- IFACE: batched L[F, 12, V] -------------------------------------
-    # Route each (frame, atom) → slab index = frame * 12 + type.
-    L_count = torch.zeros((F * 12, nx, ny, nz), device=device, dtype=dtype)
-    group_f12 = frame_idx_per_atom * 12 + lig_group_iface_flat
-    _grouped_spread_nearest_add(
-        L_count, lxyz_flat, group_f12,
-        torch.ones(lxyz_flat.shape[0], device=device, dtype=dtype),
-        x_grid, y_grid, z_grid,
+    F_total = lig_xyz.shape[0]
+    chunk_kwargs = dict(
+        lig_radius=lig_radius, lig_sasa=lig_sasa,
+        lig_atomtype_id=lig_atomtype_id, lig_charge_id=lig_charge_id,
+        x_grid=x_grid, y_grid=y_grid, z_grid=z_grid,
+        surface_threshold=surface_threshold, elec_mode=elec_mode,
     )
-    L = (L_count.view(F, 12, nx, ny, nz) > 0).to(dtype)
-    # T[f, i, j] = <L[f, i], H[j]>; batched bmm.
-    T = torch.einsum("fiv,jv->fij", L.reshape(F, 12, V), H.reshape(12, V))
-    score_iface = (iface_matrix.unsqueeze(0) * T).reshape(F, -1).sum(-1)
-
-    # --- ELEC (mode-dependent forward) ----------------------------------
-
-    if elec_mode == "coulomb":
-        # Per-frame ligand charge grid Q_L: scatter +q_lig_atom at the
-        # nearest cell. The paper's Im[L] = -q is absorbed into the final
-        # sign below so that `score_elec` returns the Coulomb interaction
-        # energy ΣΣ qᵢqⱼ / rᵢⱼ (negative for favorable, positive for
-        # clashing). `score_total` then uses `+ β × score_elec` as in the
-        # training notebook.
-        lig_partial_q = partial_charge_per_atom(lig_charge_id, charge_score)
-        lig_partial_q_flat = lig_partial_q.unsqueeze(0).expand(F, -1).reshape(-1)
-        Q_L_flat = torch.zeros(F * nx * ny * nz, device=device, dtype=dtype)
-        # frame_idx_per_atom already offsets by (nx*ny*nz) per frame when
-        # we pack (frame * nx*ny*nz + cell) — reuse _grouped_spread_nearest_add
-        # semantics by treating "frame" as the group.
-        _grouped_spread_nearest_add(
-            Q_L_flat.view(F, nx, ny, nz),
-            lxyz_flat, frame_idx_per_atom, lig_partial_q_flat,
-            x_grid, y_grid, z_grid,
+    use_chunks = (
+        frame_chunk_size is not None
+        and frame_chunk_size > 0
+        and frame_chunk_size < F_total
+    )
+    if not use_chunks:
+        return _score_ligand_chunk(
+            lig_xyz, alpha, iface_matrix, beta, charge_score,
+            H, rec_sc_real, rec_sc_imag, V_rec_or_U,
+            **chunk_kwargs,
         )
-        Q_L = Q_L_flat.view(F, nx, ny, nz)
-        # Coulomb interaction energy per frame:
-        #   score_elec[f] = Σ_cells V_rec(cell) × Q_L[f, cell]
-        #               = Σ_lig_atom q_lig × V_rec(r_lig_atom)
-        #               = ΣΣ_ij q_i q_j / r_ij
-        score_elec = (V_rec.unsqueeze(0) * Q_L).reshape(F, -1).sum(-1)
-    else:  # elec_mode == "legacy"
-        valid_flat = lig_group_charge_flat >= 0
-        grp_f11 = frame_idx_per_atom * 11 + lig_group_charge_flat.clamp(min=0)
-        grp_f11 = grp_f11[valid_flat]
-        xyz_c_flat = lxyz_flat[valid_flat]
-        V_count = torch.zeros((F * 11, nx, ny, nz), device=device, dtype=dtype)
-        _grouped_spread_nearest_add(
-            V_count, xyz_c_flat, grp_f11,
-            torch.ones(xyz_c_flat.shape[0], device=device, dtype=dtype),
-            x_grid, y_grid, z_grid,
-        )
-        V_grid = V_count.view(F, 11, nx, ny, nz)
-        c = (V_grid.reshape(F, 11, V) * U.reshape(11, V).unsqueeze(0)).sum(-1)  # (F, 11)
-        score_elec = (charge_score.pow(2).unsqueeze(0) * c).sum(-1)
 
-    return alpha * score_sc + score_iface + beta * score_elec
+    # Checkpoint only pays off when something downstream is collecting
+    # autograd; under `torch.no_grad()` we just loop to cap peak memory.
+    use_checkpoint = torch.is_grad_enabled() and any(
+        t.requires_grad for t in (alpha, iface_matrix, beta, charge_score, V_rec_or_U)
+    )
+
+    def _run_chunk(
+        lxc, a, im, b, cs, Ht, rsr, rsi, vru,
+    ):
+        return _score_ligand_chunk(
+            lxc, a, im, b, cs, Ht, rsr, rsi, vru, **chunk_kwargs,
+        )
+
+    parts: list[torch.Tensor] = []
+    for s in range(0, F_total, frame_chunk_size):
+        e = min(s + frame_chunk_size, F_total)
+        lxc = lig_xyz[s:e]
+        if use_checkpoint:
+            scores_chunk = checkpoint(
+                _run_chunk,
+                lxc, alpha, iface_matrix, beta, charge_score,
+                H, rec_sc_real, rec_sc_imag, V_rec_or_U,
+                use_reentrant=False,
+            )
+        else:
+            scores_chunk = _run_chunk(
+                lxc, alpha, iface_matrix, beta, charge_score,
+                H, rec_sc_real, rec_sc_imag, V_rec_or_U,
+            )
+        parts.append(scores_chunk)
+    return torch.cat(parts, dim=0)

@@ -90,19 +90,23 @@ def eval_split(
     beta: torch.Tensor,
     charge: torch.Tensor,
     top_k_eval: int = 10,
+    frame_chunk_size: int | None = None,
 ) -> None:
     """Print a compact per-protein + summary line of Hit-in-top-K counts."""
     total_hit, total_with_any_hit = 0, 0
-    for p, name in zip(proteins, names):
-        scores = p.call(alpha, iface, beta, charge).detach()
-        n_hit_top = hit_in_top_k(p, scores, top_k_eval)
-        total_hit += n_hit_top
-        total_with_any_hit += int(p.hit_mask.any().item())
-        n_hits = int(p.hit_mask.sum().item())
-        print(
-            f"  {name}: {n_hit_top:>3d}/{top_k_eval} in top-{top_k_eval} "
-            f"({n_hits:>4d} total hits / {p.lig_xyz.shape[0]} poses)"
-        )
+    with torch.no_grad():
+        for p, name in zip(proteins, names):
+            scores = p.call(
+                alpha, iface, beta, charge, frame_chunk_size=frame_chunk_size,
+            )
+            n_hit_top = hit_in_top_k(p, scores, top_k_eval)
+            total_hit += n_hit_top
+            total_with_any_hit += int(p.hit_mask.any().item())
+            n_hits = int(p.hit_mask.sum().item())
+            print(
+                f"  {name}: {n_hit_top:>3d}/{top_k_eval} in top-{top_k_eval} "
+                f"({n_hits:>4d} total hits / {p.lig_xyz.shape[0]} poses)"
+            )
     print(f"  -> {total_hit} hits in top-{top_k_eval} across "
           f"{total_with_any_hit}/{len(proteins)} proteins with any hit at all")
 
@@ -123,6 +127,10 @@ def main() -> None:
     ap.add_argument("--device", default="auto", help="auto | cpu | cuda | mps")
     ap.add_argument("--top-k-eval", type=int, default=10,
                     help="rank metric: Hit count in top-K-eval (default 10)")
+    ap.add_argument("--frame-chunk-size", type=int, default=64,
+                    help="split the F ligand frames into chunks of this size "
+                         "(gradient checkpoint) to bound peak VRAM; 0 disables "
+                         "chunking (default 64, use 0 if VRAM is plentiful)")
     ap.add_argument("--out", type=Path, default=OUT_DIR / "trained_params_bm4.pt")
     args = ap.parse_args()
 
@@ -173,6 +181,7 @@ def main() -> None:
         raise SystemExit("train set is empty (try a larger --n-proteins)")
 
     # 4. Train.
+    frame_chunk_size = args.frame_chunk_size if args.frame_chunk_size > 0 else None
     out = train(
         train_proteins,
         n_epoch=args.epochs,
@@ -180,6 +189,7 @@ def main() -> None:
         device=device,
         dtype=dtype,
         progress_every=max(1, args.epochs // 10),
+        frame_chunk_size=frame_chunk_size,
     )
     hist = out["history"]["loss"]
     print(f"\ntrain loss: {hist[0]:.3e} -> {hist[-1]:.3e} "
@@ -194,12 +204,14 @@ def main() -> None:
     print("train set:")
     eval_split(train_proteins, train_names,
                alpha=alpha_t, iface=iface_t, beta=beta_t, charge=charge_t,
-               top_k_eval=args.top_k_eval)
+               top_k_eval=args.top_k_eval,
+               frame_chunk_size=frame_chunk_size)
     if test_proteins:
         print("test set (generalization):")
         eval_split(test_proteins, test_names,
                    alpha=alpha_t, iface=iface_t, beta=beta_t, charge=charge_t,
-                   top_k_eval=args.top_k_eval)
+                   top_k_eval=args.top_k_eval,
+                   frame_chunk_size=frame_chunk_size)
 
     # 6. Save.
     args.out.parent.mkdir(parents=True, exist_ok=True)
