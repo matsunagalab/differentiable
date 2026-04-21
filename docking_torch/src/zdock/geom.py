@@ -122,10 +122,12 @@ def orient(
       5. Project the coordinates onto the new basis: `xyz' = p_axis @ xyz.T`.
 
     Sign ambiguity: the eigenvectors of the inertia tensor are only defined
-    up to overall sign per axis. LAPACK/SVD typically normalizes so that
-    the largest-magnitude component of each column is positive, which
-    matches Julia. We impose the same convention so torch.linalg.eigh
-    (ascending eigenvalues) agrees with Julia's `svd`+reversal.
+    up to overall sign per axis, and different SVD backends (CPU LAPACK,
+    cuSOLVER on CUDA, MPS's fallback) disagree on which sign to pick. To
+    make `orient()` bit-deterministic across devices — and to match Julia
+    (which uses CPU LAPACK) — we always run the 3×3 SVD on CPU and move
+    the result back. The tensor is tiny, so the host↔device copy is a few
+    microseconds regardless of dtype or device.
     """
     if xyz.ndim != 2 or xyz.shape[1] != 3:
         raise ValueError(f"xyz must be (N, 3), got {tuple(xyz.shape)}")
@@ -154,20 +156,12 @@ def orient(
     I[1, 2] = -(m * y * z).sum()
     I[2, 1] = I[1, 2]
 
-    # Julia uses `svd(I)` — which returns U, S, Vt with S in DESCENDING
-    # order. `F.Vt[end:-1:1, :]` flips to ascending. We mirror that:
-    # torch.linalg.svd gives U, S, Vh (= Vt) in descending; flip to get
-    # ascending. This matches Julia's LAPACK SVD sign convention for the
-    # symmetric positive-semidefinite inertia tensor I.
-    #
-    # MPS does not implement `linalg_svd`, falling back to CPU with a
-    # warning; we bypass the warning by running the 3x3 SVD on CPU
-    # explicitly (trivial cost) and copying the 3x3 result back.
-    if I.device.type == "mps":
-        U, S, Vt = torch.linalg.svd(I.cpu())
-        Vt = Vt.to(I.device)
-    else:
-        U, S, Vt = torch.linalg.svd(I)
+    # Always run the 3×3 SVD on CPU: cuSOLVER (CUDA) and the MPS fallback
+    # pick different sign conventions from CPU LAPACK, which makes
+    # orient() backend-dependent — and diverges from Julia, which also
+    # uses CPU LAPACK. Forcing CPU is a 3×3 copy, effectively free.
+    U, S, Vt = torch.linalg.svd(I.cpu())
+    Vt = Vt.to(device=device, dtype=dtype)
     p_axis = torch.flip(Vt, dims=[0]).contiguous()  # smallest→largest rows
 
     # Reflection guard (Julia's sole sign check): ensure right-handed.
