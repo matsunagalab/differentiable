@@ -49,6 +49,7 @@ def load_training_dataset(
     dtype: torch.dtype = torch.float64,
     protein_names: list[str] | None = None,
     rmsd_threshold_angstrom: float | None = None,
+    max_poses: int | None = None,
 ) -> list[ProteinInputs]:
     """Read the consolidated h5 and materialize one `ProteinInputs` per
     selected protein.
@@ -63,12 +64,22 @@ def load_training_dataset(
         rmsd_threshold_angstrom: if given, override the stored threshold and
             recompute `hit_mask` from the group's `rmsd` field. Raises
             ValueError for any group missing `rmsd` in that case.
+        max_poses: optional cap on the F dimension applied at h5 read time.
+            Slices `lig_xyz`, `rmsd`, and `hit_mask` to `[:max_poses]` so
+            the full 54,000-pose trajectory never reaches device memory.
+            Poses in the h5 are stored in ZDOCK raw-score order (highest
+            first), so `max_poses=K` is identical to taking the ZDOCK
+            top-K — the same semantics as `examples/04_train_on_bm4.py:
+            cap_poses`. `None` (default) reads every pose.
 
     Returns:
         List of `ProteinInputs`, one per selected group.
     """
     h5_path = Path(h5_path)
     out: list[ProteinInputs] = []
+
+    # Slice spec for F-dim datasets. `slice(None)` == `[:]`, i.e. full read.
+    f_slice: slice = slice(None) if max_poses is None else slice(0, max_poses)
 
     with h5py.File(h5_path, "r") as f:
         names = protein_names if protein_names is not None else sorted(
@@ -81,17 +92,21 @@ def load_training_dataset(
             if not isinstance(g, h5py.Group):
                 raise TypeError(f"{h5_path}[{name}]: not a group")
 
-            # Float tensors → dtype, on device.
+            # F-invariant float tensors.
             def _f(key: str) -> torch.Tensor:
                 return torch.as_tensor(g[key][()], dtype=dtype, device=device)
 
-            # Integer tensors → int64, on device.
+            # F-invariant integer tensors.
             def _i(key: str) -> torch.Tensor:
                 return torch.as_tensor(g[key][()], dtype=torch.int64, device=device)
 
+            # F-dim float tensor: apply pose slice at h5 read.
+            def _f_poses(key: str) -> torch.Tensor:
+                return torch.as_tensor(g[key][f_slice], dtype=dtype, device=device)
+
             rmsd_ds = g.get("rmsd")
             rmsd = (
-                torch.as_tensor(rmsd_ds[()], dtype=dtype, device=device)
+                torch.as_tensor(rmsd_ds[f_slice], dtype=dtype, device=device)
                 if rmsd_ds is not None else None
             )
 
@@ -116,7 +131,7 @@ def load_training_dataset(
                     hit_mask = (rmsd <= default_threshold)
                 else:
                     hit_mask = torch.as_tensor(
-                        hit_mask_ds[()], dtype=torch.bool, device=device,
+                        hit_mask_ds[f_slice], dtype=torch.bool, device=device,
                     )
 
             out.append(
@@ -126,7 +141,7 @@ def load_training_dataset(
                     rec_sasa=_f("rec_sasa"),
                     rec_atomtype_id=_i("rec_atomtype_id"),
                     rec_charge_id=_i("rec_charge_id"),
-                    lig_xyz=_f("lig_xyz"),
+                    lig_xyz=_f_poses("lig_xyz"),
                     lig_radius=_f("lig_radius"),
                     lig_sasa=_f("lig_sasa"),
                     lig_atomtype_id=_i("lig_atomtype_id"),

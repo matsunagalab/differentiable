@@ -165,12 +165,15 @@ def main() -> None:
     print(f"train ({len(train_names)}): {train_names}")
     print(f"test  ({len(test_names)}): {test_names}")
 
-    # 3. Load and cap poses.
+    # 3. Load and cap poses. max_poses=args.top_k ensures the full 54k-pose
+    # trajectory never touches device memory; cap_poses below is idempotent
+    # when the h5 read already gave us <= top_k poses.
     def _load(names: list[str]) -> list[ProteinInputs]:
         if not names:
             return []
         raw = load_training_dataset(
             args.h5, device=device, dtype=dtype, protein_names=names,
+            max_poses=args.top_k,
         )
         return [cap_poses(p, args.top_k) for p in raw]
 

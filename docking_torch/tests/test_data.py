@@ -104,3 +104,45 @@ def test_missing_protein_raises(tmp_path):
     _write_fixture(p, with_hit_mask=True, with_rmsd=False)
     with pytest.raises(KeyError, match="NOPE"):
         load_training_dataset(p, protein_names=["NOPE"])
+
+
+def test_max_poses_slices_F_dim_consistently(tmp_path):
+    """`max_poses` caps lig_xyz, rmsd, and hit_mask at h5 read time so
+    the full F=5 trajectory never touches downstream memory. All three
+    F-dimensional arrays must agree on the truncated length."""
+    p = tmp_path / "fixture.h5"
+    _write_fixture(p, with_hit_mask=True, with_rmsd=True)
+    proteins = load_training_dataset(p, dtype=torch.float64, max_poses=3)
+    for prot in proteins:
+        assert prot.lig_xyz.shape[0] == 3
+        assert prot.hit_mask.shape[0] == 3
+        assert prot.rmsd is not None
+        assert prot.rmsd.shape[0] == 3
+        # Non-F-dim arrays must be unchanged.
+        assert prot.rec_xyz.shape[0] == 4
+        assert prot.lig_radius.shape[0] == 3  # happens to equal N_lig, not F
+
+
+def test_max_poses_with_rmsd_threshold_override(tmp_path):
+    """`rmsd_threshold_angstrom` must operate on the *sliced* rmsd, so
+    the derived hit_mask reflects only the retained poses."""
+    p = tmp_path / "fixture.h5"
+    _write_fixture(p, with_hit_mask=False, with_rmsd=True)
+    # PRT1 rmsd = [1, 2, 3, 4, 5]; sliced to 3 → [1, 2, 3]; threshold 2.5 → [T, T, F]
+    proteins = load_training_dataset(
+        p, dtype=torch.float64, max_poses=3, rmsd_threshold_angstrom=2.5,
+    )
+    assert proteins[0].hit_mask.shape == (3,)
+    assert proteins[0].hit_mask.tolist() == [True, True, False]
+
+
+def test_max_poses_none_matches_unscoped_load(tmp_path):
+    """`max_poses=None` (default) must be byte-identical to a regular load."""
+    p = tmp_path / "fixture.h5"
+    _write_fixture(p, with_hit_mask=True, with_rmsd=True)
+    a = load_training_dataset(p, dtype=torch.float64)
+    b = load_training_dataset(p, dtype=torch.float64, max_poses=None)
+    for pa, pb in zip(a, b):
+        assert torch.equal(pa.lig_xyz, pb.lig_xyz)
+        assert torch.equal(pa.hit_mask, pb.hit_mask)
+        assert torch.equal(pa.rmsd, pb.rmsd)
