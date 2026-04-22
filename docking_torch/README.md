@@ -588,6 +588,35 @@ propagates through the FFT to `alpha / iface / beta / charge_score_lut`
 without NaN. Sparse gradient through `torch.topk`, so only poses in
 the retained top-N contribute.
 
+### (2c) Batched decoy generation over BM4 — `examples/05_fft_generate_decoys.py`
+
+Iterates over every protein in `bm4_full.h5` and writes FFT-generated
+decoys (top-N poses with scores, rotations, translations, and
+reconstructed ligand coordinates) to an output h5. This is the
+pure-PyTorch replacement for ZDOCK's decoy-generation step — no C /
+Fortran binary required. Handles OOM by automatically halving
+`rot_chunk_size`.
+
+```bash
+# Quick subset (3 proteins × 1024 rotations × top-500): ~15 s on A6000
+uv run python examples/05_fft_generate_decoys.py --device cuda \
+    --proteins 1PPE 2SIC 1R0R --n-rotations 1024 --ntop 500 \
+    --out out/bm4_fft_decoys_smoke.h5
+
+# Full BM4 with Julia defaults, random 4096-rotation sampling
+uv run python examples/05_fft_generate_decoys.py --device cuda
+
+# ZDOCK-comparable ~54k rotations (6° Euler), trained params
+uv run python examples/05_fft_generate_decoys.py --device cuda \
+    --euler-deg 6.0 --params-ckpt out/trained_params_rank.pt
+```
+
+Output layout (per protein group):
+`lig_xyz_decoy (F, N_lig, 3)`,  `score (F,)`,  `rotation_quat (F, 4)`,
+`translation (F, 3)`, and `rmsd_vs_bm4_best (F,)` if ground-truth
+RMSD is available. Root attrs capture the rotation grid and scorer
+params so downstream consumers know what produced the file.
+
 ### (3) Evaluate the held-out test split — `examples/03_evaluate.py`
 
 Reads the ckpt from (2), pulls out `test_proteins` (and the `h5`,
