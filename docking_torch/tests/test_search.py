@@ -25,6 +25,9 @@ from zdock.search import (
     _build_ligand_elec_grid_single,
     _build_ligand_iface_grid_single,
     _build_ligand_sc_grid_single,
+    _build_ligand_sc_grids_vectorised,
+    _build_ligand_iface_grids_vectorised,
+    _build_ligand_elec_grids_vectorised,
     _build_receptor_elec_grid,
     _build_receptor_iface_weighted_grids,
     _build_receptor_sc_grids,
@@ -35,6 +38,9 @@ from zdock.search import (
     docking_score_sc_direct,
     docking_search,
     docking_search_sc,
+    prepare_ligand,
+    prepare_receptor,
+    prepare_search_inputs,
 )
 
 
@@ -676,6 +682,177 @@ def test_docking_search_returns_correct_top1(sc_only_params):
 # ---------------------------------------------------------------------------
 # V-autograd: differentiability through the FFT search
 # ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# V-vectorised: batched-scatter ligand grids match the loop version
+# ---------------------------------------------------------------------------
+
+
+def test_vectorised_ligand_grids_match_loop():
+    """`_build_ligand_*_grids_vectorised` produce bit-identical output
+    to the per-rotation loop variants used in Phase 1/2 tests."""
+    dtype = torch.float64
+    g = torch.Generator().manual_seed(17)
+    B, N_lig = 5, 11
+    lig_xyz = torch.randn(B, N_lig, 3, generator=g, dtype=dtype) * 2.5
+    lig_radius = torch.rand(N_lig, generator=g, dtype=dtype) + 1.0
+    lig_sasa = torch.rand(N_lig, generator=g, dtype=dtype) * 4.0
+    lig_atomtype_id = torch.randint(1, 13, (N_lig,), generator=g, dtype=torch.int64)
+    lig_charge_id = torch.randint(1, 12, (N_lig,), generator=g, dtype=torch.int64)
+
+    # Build a small fake grid
+    rec_xyz = torch.randn(8, 3, generator=g, dtype=dtype) * 3.0
+    _, _, xg, yg, zg = generate_grid(
+        rec_xyz, lig_xyz[0], spacing=3.0, dtype=dtype,
+    )
+
+    lig_surf = lig_sasa > 1.0
+    charge_lut = default_charge_score_lut_t = torch.rand(11, generator=g, dtype=dtype)
+
+    # Vectorised
+    L_sc_r_v, L_sc_i_v = _build_ligand_sc_grids_vectorised(
+        lig_xyz, lig_radius, lig_surf, xg, yg, zg,
+    )
+    L_iface_v = _build_ligand_iface_grids_vectorised(
+        lig_xyz, lig_atomtype_id, xg, yg, zg,
+    )
+    L_elec_v = _build_ligand_elec_grids_vectorised(
+        lig_xyz, lig_charge_id, charge_lut, xg, yg, zg,
+    )
+
+    # Loop reference
+    from zdock.search import _build_ligand_sc_grid_single
+    for b in range(B):
+        Lr_s, Li_s = _build_ligand_sc_grid_single(
+            lig_xyz[b], lig_radius, lig_surf, xg, yg, zg,
+        )
+        assert torch.equal(L_sc_r_v[b], Lr_s)
+        assert torch.equal(L_sc_i_v[b], Li_s)
+
+        L_if_s = _build_ligand_iface_grid_single(
+            lig_xyz[b], lig_atomtype_id, xg, yg, zg,
+        )
+        assert torch.equal(L_iface_v[b], L_if_s)
+
+        L_el_s = _build_ligand_elec_grid_single(
+            lig_xyz[b], lig_charge_id, charge_lut, xg, yg, zg,
+        )
+        assert torch.equal(L_elec_v[b], L_el_s)
+
+
+# ---------------------------------------------------------------------------
+# V-prepare: unified preprocessing idempotence against docking_score_elec
+# ---------------------------------------------------------------------------
+
+
+def test_prepare_ligand_matches_docking_score_elec_internal_orient():
+    """`prepare_ligand` output fed into `docking_score_elec` as
+    `lig_xyz_for_grid` must give the same score as letting
+    `docking_score_elec` do the orient internally on the same raw input.
+
+    This is the key invariant that makes `prepare_search_inputs` a
+    drop-in for the "user provides raw PDB" workflow.
+    """
+    dtype = torch.float64
+    g = torch.Generator().manual_seed(5)
+    N_rec, N_lig = 10, 8
+    rec_xyz_raw = torch.randn(N_rec, 3, generator=g, dtype=dtype) * 3.0
+    lig_xyz_raw = torch.randn(N_lig, 3, generator=g, dtype=dtype) * 2.0
+
+    rec_radius = torch.rand(N_rec, generator=g, dtype=dtype) + 1.0
+    rec_sasa = torch.rand(N_rec, generator=g, dtype=dtype) * 4.0
+    rec_atomtype_id = torch.randint(1, 13, (N_rec,), generator=g, dtype=torch.int64)
+    rec_charge_id = torch.randint(1, 12, (N_rec,), generator=g, dtype=torch.int64)
+
+    lig_radius = torch.rand(N_lig, generator=g, dtype=dtype) + 1.0
+    lig_sasa = torch.rand(N_lig, generator=g, dtype=dtype) * 4.0
+    lig_atomtype_id = torch.randint(1, 13, (N_lig,), generator=g, dtype=torch.int64)
+    lig_charge_id = torch.randint(1, 12, (N_lig,), generator=g, dtype=torch.int64)
+
+    alpha = torch.tensor(0.01, dtype=dtype)
+    beta = torch.tensor(3.0, dtype=dtype)
+    iface_flat = torch.randn(
+        144, dtype=dtype,
+        generator=torch.Generator().manual_seed(1),
+    )
+    charge_lut = default_charge_score_lut(dtype=dtype)
+
+    # Raw inputs (decenter rec, leave lig un-oriented) — same as what a
+    # user would have from a PDB.
+    rec_xyz_dec = rec_xyz_raw - rec_xyz_raw.mean(dim=0)
+
+    # Path A: let docking_score_elec orient internally.
+    lig_pose = lig_xyz_raw.unsqueeze(0)
+    score_A = docking_score_elec(
+        rec_xyz_dec, rec_radius, rec_sasa, rec_atomtype_id, rec_charge_id,
+        lig_pose, lig_radius, lig_sasa, lig_atomtype_id, lig_charge_id,
+        alpha=alpha, iface_ij_flat=iface_flat, beta=beta, charge_score=charge_lut,
+        spacing=3.0,
+    ).item()
+
+    # Path B: prepare_ligand explicitly, then pass as lig_xyz_for_grid.
+    lig_xyz_ref = prepare_ligand(lig_xyz_raw, lig_atomtype_id)
+    score_B = docking_score_elec(
+        rec_xyz_dec, rec_radius, rec_sasa, rec_atomtype_id, rec_charge_id,
+        lig_pose, lig_radius, lig_sasa, lig_atomtype_id, lig_charge_id,
+        alpha=alpha, iface_ij_flat=iface_flat, beta=beta, charge_score=charge_lut,
+        lig_xyz_for_grid=lig_xyz_ref, spacing=3.0,
+    ).item()
+
+    assert abs(score_A - score_B) / (abs(score_A) + 1) < 1e-14, (
+        f"prepare_ligand diverges from internal orient: A={score_A} B={score_B}"
+    )
+
+
+def test_prepare_search_inputs_roundtrip():
+    """`prepare_search_inputs` returns (rec, lig) compatible with both
+    `docking_score_elec` (via `lig_xyz_for_grid`) and
+    `docking_search` — a single pose scored both ways must agree."""
+    dtype = torch.float64
+    g = torch.Generator().manual_seed(11)
+    N_rec, N_lig = 10, 6
+    rec_xyz_raw = torch.randn(N_rec, 3, generator=g, dtype=dtype) * 2.0
+    lig_xyz_raw = torch.randn(N_lig, 3, generator=g, dtype=dtype) * 1.5
+    rec_radius = torch.rand(N_rec, generator=g, dtype=dtype) + 1.0
+    rec_sasa = torch.rand(N_rec, generator=g, dtype=dtype) * 4.0
+    rec_atomtype_id = torch.randint(1, 13, (N_rec,), generator=g, dtype=torch.int64)
+    rec_charge_id = torch.randint(1, 12, (N_rec,), generator=g, dtype=torch.int64)
+    lig_radius = torch.rand(N_lig, generator=g, dtype=dtype) + 1.0
+    lig_sasa = torch.rand(N_lig, generator=g, dtype=dtype) * 4.0
+    lig_atomtype_id = torch.randint(1, 13, (N_lig,), generator=g, dtype=torch.int64)
+    lig_charge_id = torch.randint(1, 12, (N_lig,), generator=g, dtype=torch.int64)
+    alpha = torch.tensor(0.01, dtype=dtype)
+    beta = torch.tensor(3.0, dtype=dtype)
+    iface_flat = torch.randn(144, dtype=dtype, generator=torch.Generator().manual_seed(1))
+    charge_lut = default_charge_score_lut(dtype=dtype)
+
+    rec_xyz, lig_xyz_ref = prepare_search_inputs(
+        rec_xyz_raw, lig_xyz_raw, lig_atomtype_id,
+    )
+    q_id = torch.tensor([[0.0, 0.0, 0.0, 1.0]], dtype=dtype)
+
+    # docking_search top-1 must match a direct docking_score_elec at the
+    # reconstructed pose (same invariant as earlier round-trip test).
+    result = docking_search(
+        rec_xyz, rec_radius, rec_sasa, rec_atomtype_id, rec_charge_id,
+        lig_xyz_ref, lig_radius, lig_sasa, lig_atomtype_id, lig_charge_id,
+        quaternions=q_id,
+        alpha=alpha, iface_ij_flat=iface_flat, beta=beta,
+        charge_score_lut=charge_lut,
+        spacing=3.0, ntop=20, rot_chunk_size=1,
+    )
+    top_t = result.translations[0]
+    lig_pose = (lig_xyz_ref + top_t).unsqueeze(0)
+    tot_e = docking_score_elec(
+        rec_xyz, rec_radius, rec_sasa, rec_atomtype_id, rec_charge_id,
+        lig_pose, lig_radius, lig_sasa, lig_atomtype_id, lig_charge_id,
+        alpha=alpha, iface_ij_flat=iface_flat, beta=beta, charge_score=charge_lut,
+        lig_xyz_for_grid=lig_xyz_ref, spacing=3.0,
+    ).item()
+    tot_fft = result.scores[0].item()
+    rel = abs(tot_e - tot_fft) / (abs(tot_e) + 1)
+    assert rel < 1e-10, f"top-1: elec={tot_e} fft={tot_fft}"
 
 
 def test_docking_search_autograd_smoke():

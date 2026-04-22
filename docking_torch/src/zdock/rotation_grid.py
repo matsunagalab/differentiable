@@ -4,21 +4,29 @@ ZDOCK 3.0.2 uses a specific Euler-angle table at 6° spacing. This
 module provides simpler drop-in alternatives that are adequate for
 demonstration and experimentation:
 
-  * `random_quaternions` — N uniformly-distributed unit quaternions
-    (Gaussian-sampled then normalised, which is uniform on SO(3)).
+  * `random_quaternions` — N uniformly-distributed SO(3) rotations
+    via `scipy.spatial.transform.Rotation.random`.
   * `euler_quaternions` — (φ, θ, ψ) ZYZ Euler grid at `deg` spacing.
 
 Exact ZDOCK-table reproduction is a future refinement (see
-PORT_PLAN_FFT.md); the `rotate` convention matches `geom.rotate`
-(docking.jl lines 1469–1490) so poses are compatible with the rest
-of this package.
+PORT_PLAN_FFT.md).
+
+**Quaternion convention**: this module returns quaternions in the
+format consumed by `geom.rotate` (= `docking.jl::rotate!`), which is
+the *inverse* of scipy's active-rotation convention. For a uniform
+sampler this is immaterial — the inverted distribution is still
+uniform on SO(3). If you need to interoperate with scipy's
+`Rotation.apply` outcome-by-outcome, apply the quaternion conjugate
+`(x, y, z, w) → (−x, −y, −z, w)`.
 """
 
 from __future__ import annotations
 
 import math
 
+import numpy as np
 import torch
+from scipy.spatial.transform import Rotation as _ScipyRotation
 
 
 def random_quaternions(
@@ -28,20 +36,46 @@ def random_quaternions(
     device: torch.device | str | None = None,
     dtype: torch.dtype = torch.float64,
 ) -> torch.Tensor:
-    """Return `(n, 4)` uniformly-distributed unit quaternions.
+    """Return `(n, 4)` uniformly-distributed SO(3) quaternions via
+    `scipy.spatial.transform.Rotation.random`.
 
-    Uses Gaussian 4-vectors normalised to unit norm — a standard way
-    to sample SO(3) uniformly (Shoemake 1992).
+    Output is in `geom.rotate` / Julia `rotate!` convention (see
+    module docstring). For uniform sampling the convention choice
+    has no effect on the distribution.
     """
-    # Always sample on CPU (torch CUDA RNG is streaming-only; a seeded
-    # CPU generator gives reproducible results across backends), then
-    # move to the target device.
-    g = torch.Generator(device="cpu").manual_seed(seed)
-    q = torch.randn(n, 4, generator=g, dtype=dtype)
-    q = q / q.norm(dim=-1, keepdim=True)
+    r = _ScipyRotation.random(n, random_state=seed)
+    q = r.as_quat()  # (n, 4) scalar-last (x, y, z, w)
+    q = torch.as_tensor(q, dtype=dtype)
     if device is not None:
         q = q.to(device)
     return q
+
+
+def scipy_rotations_to_quaternions(
+    r: _ScipyRotation,
+    *,
+    as_inverse: bool = True,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """Convert a `scipy.spatial.transform.Rotation` (single or batch)
+    to `(N, 4)` quaternions for use with `geom.rotate`.
+
+    `as_inverse=True` (default) emits the quaternion conjugate of
+    scipy's output so that `geom.rotate(v, q)` produces the same
+    rotated vector as `r.apply(v)`. Set to False to pass the raw
+    scipy quaternions (equivalent to applying the inverse rotation
+    under our convention — fine for uniform samplers but not for
+    known oriented rotations).
+    """
+    q = r.as_quat().reshape(-1, 4)
+    if as_inverse:
+        q = q.copy()
+        q[:, :3] *= -1  # quaternion conjugate = inverse of unit quat
+    q_t = torch.as_tensor(np.ascontiguousarray(q), dtype=dtype)
+    if device is not None:
+        q_t = q_t.to(device)
+    return q_t
 
 
 def euler_quaternions(

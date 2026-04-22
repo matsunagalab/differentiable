@@ -35,8 +35,8 @@ import torch
 
 import math
 
-from .atomtypes import partial_charge_per_atom
-from .geom import generate_grid
+from .atomtypes import iface_ij, partial_charge_per_atom
+from .geom import decenter, generate_grid, orient
 from .score import (
     _assign_sc_plus,
     _assign_sc_minus,
@@ -204,11 +204,11 @@ def _build_ligand_sc_grids_batch(
     *,
     surface_threshold: float = 1.0,
 ) -> tuple[torch.Tensor, torch.Tensor]:
-    """Scatter each rotated ligand in the batch into its own SC grid.
-
-    Phase-1 implementation: Python-loop over B, replicating
-    `docking_score_elec`'s internal ligand SC construction. Batching
-    the scatter is a Phase-3 optimisation.
+    """Batched ligand SC grid construction — see
+    `_build_ligand_sc_grids_vectorised` for the fast path used by
+    `docking_search`. This wrapper is kept as a Phase-1 reference
+    (loop over B) for bisection if the vectorised version is
+    suspected of introducing numerical differences.
 
     Returns (L_real, L_imag), each (B, nx, ny, nz).
     """
@@ -226,6 +226,132 @@ def _build_ligand_sc_grids_batch(
         L_real[b] = Lr
         L_imag[b] = Li
     return L_real, L_imag
+
+
+# ---------------------------------------------------------------------------
+# Vectorised per-rotation grid construction (GPU perf path for Phase 3b).
+#
+# Collapses the rotation-chunk Python loop into a single flat-atom scatter
+# per physical quantity, using frame-compound group indices. Matches
+# `_score_ligand_chunk`'s pattern in score.py.
+# ---------------------------------------------------------------------------
+
+
+def _build_ligand_sc_grids_vectorised(
+    lig_xyz_rot: torch.Tensor,   # (B, N, 3)
+    lig_radius: torch.Tensor,    # (N,)
+    lig_surf: torch.Tensor,      # (N,) bool
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    z_grid: torch.Tensor,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """Vectorised SC grid construction across a rotation batch.
+
+    Uses flat atom arrays with per-atom frame index, so the two (surface
+    and core) layer scatters each run as a single `_grouped_spread_*`
+    call regardless of B — no Python-side iteration over rotations.
+    Output is bit-identical to `_build_ligand_sc_grid_single` applied
+    per rotation.
+    """
+    B, N_lig, _ = lig_xyz_rot.shape
+    nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
+    device = lig_xyz_rot.device
+    dtype = lig_xyz_rot.dtype
+
+    xyz_flat = lig_xyz_rot.reshape(-1, 3)
+    frame_idx = torch.arange(B, device=device).repeat_interleave(N_lig)
+    radius_flat = lig_radius.unsqueeze(0).expand(B, -1).reshape(-1)
+    surf_flat = lig_surf.unsqueeze(0).expand(B, -1).reshape(-1)
+    core_flat = ~surf_flat
+
+    def sc_union(mask: torch.Tensor, rcut_scale: float) -> torch.Tensor:
+        idx = mask.nonzero(as_tuple=True)[0]
+        if idx.numel() == 0:
+            return torch.zeros((B, nx, ny, nz), device=device, dtype=dtype)
+        cnt = torch.zeros((B, nx, ny, nz), device=device, dtype=dtype)
+        _grouped_spread_neighbors_add(
+            cnt,
+            xyz_flat[idx],
+            frame_idx[idx],
+            torch.ones(idx.numel(), device=device, dtype=dtype),
+            radius_flat[idx] * rcut_scale,
+            x_grid, y_grid, z_grid,
+        )
+        return (cnt > 0).to(dtype)
+
+    surf_layer = sc_union(surf_flat, 1.0)
+    core_layer = sc_union(core_flat, math.sqrt(1.5))
+
+    L_real = torch.maximum(surf_layer, core_layer)
+    # L_imag: core (12.25) overwrites surface (3.5) where both are set
+    # — replicates the `torch.where(lay2 > 0, ...)` overwrite pattern in
+    # `docking_score_elec`.
+    L_imag = torch.where(
+        surf_layer > 0, surf_layer * 3.5,
+        torch.zeros_like(surf_layer),
+    )
+    L_imag = torch.where(core_layer > 0, core_layer * 12.25, L_imag)
+    return L_real, L_imag
+
+
+def _build_ligand_iface_grids_vectorised(
+    lig_xyz_rot: torch.Tensor,          # (B, N, 3)
+    lig_atomtype_id: torch.Tensor,      # (N,) int
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    z_grid: torch.Tensor,
+) -> torch.Tensor:                       # (B, 12, nx, ny, nz)
+    """Vectorised ligand IFACE binary indicator grids. Compound group
+    = ``frame * 12 + atomtype_id−1`` so a single scatter populates the
+    (B × 12) slabs simultaneously.
+    """
+    B, N_lig, _ = lig_xyz_rot.shape
+    nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
+    device = lig_xyz_rot.device
+    dtype = lig_xyz_rot.dtype
+
+    xyz_flat = lig_xyz_rot.reshape(-1, 3)
+    frame_idx = torch.arange(B, device=device).repeat_interleave(N_lig)
+    type_group = (lig_atomtype_id - 1).to(torch.long).clamp(0, 11)
+    group = frame_idx * 12 + type_group.unsqueeze(0).expand(B, -1).reshape(-1)
+
+    count = torch.zeros((B * 12, nx, ny, nz), device=device, dtype=dtype)
+    _grouped_spread_nearest_add(
+        count, xyz_flat, group,
+        torch.ones(xyz_flat.shape[0], device=device, dtype=dtype),
+        x_grid, y_grid, z_grid,
+    )
+    return (count.view(B, 12, nx, ny, nz) > 0).to(dtype)
+
+
+def _build_ligand_elec_grids_vectorised(
+    lig_xyz_rot: torch.Tensor,          # (B, N, 3)
+    lig_charge_id: torch.Tensor,        # (N,) int
+    charge_score_lut: torch.Tensor,     # (11,)
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    z_grid: torch.Tensor,
+) -> torch.Tensor:                       # (B, nx, ny, nz)
+    """Vectorised ligand ELEC partial-charge grid. Single scatter with
+    frame_idx group, weights = partial charge per atom broadcast over
+    the batch.
+    """
+    B, N_lig, _ = lig_xyz_rot.shape
+    nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
+    device = lig_xyz_rot.device
+    dtype = lig_xyz_rot.dtype
+
+    xyz_flat = lig_xyz_rot.reshape(-1, 3)
+    frame_idx = torch.arange(B, device=device).repeat_interleave(N_lig)
+    lig_q = partial_charge_per_atom(lig_charge_id, charge_score_lut)
+    weights_flat = lig_q.unsqueeze(0).expand(B, -1).reshape(-1)
+
+    grid = torch.zeros((B, nx, ny, nz), device=device, dtype=dtype)
+    _grouped_spread_nearest_add(
+        grid, xyz_flat, frame_idx, weights_flat,
+        x_grid, y_grid, z_grid,
+    )
+    return grid
 
 
 def _unshift_cyclic(idx: torch.Tensor, N: int) -> torch.Tensor:
@@ -404,6 +530,71 @@ def docking_score_elec_direct(
 
 
 # ---------------------------------------------------------------------------
+# Unified preprocessing — match docking_score_elec's input preconditions.
+# ---------------------------------------------------------------------------
+
+
+def prepare_receptor(
+    rec_xyz: torch.Tensor,
+    *,
+    mass: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decenter receptor coordinates — that is what both
+    `docking_score_elec` and `docking_search` expect. No PCA-orient on
+    the receptor side (matches `docking.jl::docking()` and
+    `docking_score_elec`'s preconditions)."""
+    return decenter(rec_xyz, mass=mass)
+
+
+def prepare_ligand(
+    lig_xyz: torch.Tensor,
+    lig_atomtype_id: torch.Tensor,
+    *,
+    iface_matrix: torch.Tensor | None = None,
+) -> torch.Tensor:
+    """Decenter + PCA-orient ligand coordinates, using the iface-based
+    mass weights that `docking_score_elec` applies internally.
+
+    Replicates `docking_score_elec`'s line 425-427:
+
+        iface_matrix_for_mass = iface_ij(device=device, dtype=dtype)
+        lig_mass_weights = iface_matrix_for_mass[lig_atomtype_id - 1, 0]
+        grid_bounds_lig = orient(lig_xyz[0], mass=lig_mass_weights)
+
+    The returned coords are ready to feed into `docking_search` as
+    `lig_xyz_ref` and into `docking_score_elec` as `lig_xyz_for_grid`.
+    """
+    if lig_xyz.ndim != 2 or lig_xyz.shape[1] != 3:
+        raise ValueError(
+            f"lig_xyz must be (N_lig, 3), got {tuple(lig_xyz.shape)}"
+        )
+    if iface_matrix is None:
+        iface_matrix = iface_ij(
+            device=lig_xyz.device, dtype=lig_xyz.dtype,
+        )
+    mass_weights = iface_matrix[lig_atomtype_id - 1, 0]
+    return orient(lig_xyz, mass=mass_weights)
+
+
+def prepare_search_inputs(
+    rec_xyz: torch.Tensor,
+    lig_xyz: torch.Tensor,
+    lig_atomtype_id: torch.Tensor,
+    *,
+    iface_matrix: torch.Tensor | None = None,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    """One-shot preparation: ``(rec_xyz_decentered, lig_xyz_ref_ready)``.
+
+    Input may be raw PDB-extracted coordinates. Output is in the form
+    `docking_search` and `docking_score_elec` both expect.
+    """
+    return (
+        prepare_receptor(rec_xyz),
+        prepare_ligand(lig_xyz, lig_atomtype_id, iface_matrix=iface_matrix),
+    )
+
+
+# ---------------------------------------------------------------------------
 # Top-level search API
 # ---------------------------------------------------------------------------
 
@@ -506,27 +697,18 @@ def docking_search(
             lig_xyz_ref, quaternions[chunk_start:chunk_end],
         )  # (B, N_lig, 3)
 
-        # Allocate per-rotation ligand grids.
-        L_sc_real = torch.zeros((B, nx, ny, nz), device=device, dtype=dtype)
-        L_sc_imag = torch.zeros((B, nx, ny, nz), device=device, dtype=dtype)
-        L_iface = torch.zeros((B, 12, nx, ny, nz), device=device, dtype=dtype)
-        L_elec = torch.zeros((B, nx, ny, nz), device=device, dtype=dtype)
-
-        # Per-rotation scatter (phase-1 loop style; phase-3 optimisation
-        # target).
-        for b in range(B):
-            Lr, Li = _build_ligand_sc_grid_single(
-                lig_rot[b], lig_radius, lig_surf, x_grid, y_grid, z_grid,
-            )
-            L_sc_real[b] = Lr
-            L_sc_imag[b] = Li
-            L_iface[b] = _build_ligand_iface_grid_single(
-                lig_rot[b], lig_atomtype_id, x_grid, y_grid, z_grid,
-            )
-            L_elec[b] = _build_ligand_elec_grid_single(
-                lig_rot[b], lig_charge_id, charge_score_lut,
-                x_grid, y_grid, z_grid,
-            )
+        # Batched ligand-side scatters — single scatter per physical
+        # quantity using frame-compound group indices (no per-B loop).
+        L_sc_real, L_sc_imag = _build_ligand_sc_grids_vectorised(
+            lig_rot, lig_radius, lig_surf, x_grid, y_grid, z_grid,
+        )
+        L_iface = _build_ligand_iface_grids_vectorised(
+            lig_rot, lig_atomtype_id, x_grid, y_grid, z_grid,
+        )
+        L_elec = _build_ligand_elec_grids_vectorised(
+            lig_rot, lig_charge_id, charge_score_lut,
+            x_grid, y_grid, z_grid,
+        )
 
         # SC: complex FFT, real − imag.
         Z_L = (L_sc_real + 1j * L_sc_imag).to(complex_dtype)
