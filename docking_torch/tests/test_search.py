@@ -18,14 +18,22 @@ import numpy as np
 import pytest
 import torch
 
+from zdock.atomtypes import charge_score as default_charge_score_lut
 from zdock.geom import generate_grid
 from zdock.score import docking_score_elec
 from zdock.search import (
+    _build_ligand_elec_grid_single,
+    _build_ligand_iface_grid_single,
     _build_ligand_sc_grid_single,
+    _build_receptor_elec_grid,
+    _build_receptor_iface_weighted_grids,
     _build_receptor_sc_grids,
     _rotate_batch,
     _unshift_cyclic,
+    docking_score_elec_direct,
+    docking_score_iface_direct,
     docking_score_sc_direct,
+    docking_search,
     docking_search_sc,
 )
 
@@ -334,6 +342,334 @@ def test_unshift_cyclic():
 
 # ---------------------------------------------------------------------------
 # V-1KXQ: real protein (1KXQ phase-5 refs)
+# ---------------------------------------------------------------------------
+
+
+# ---------------------------------------------------------------------------
+# V-IFACE: direct + elec cross-checks for the IFACE term
+# ---------------------------------------------------------------------------
+
+
+def test_iface_fft_matches_direct_xcorr():
+    """FFT IFACE via `Σ_i Re(ifft(fft(W_i) · conj(fft(L_i))))` equals
+    the naive O(V²·12) cross-correlation on small grids."""
+    torch.manual_seed(0)
+    dtype = torch.float64
+    nx, ny, nz = 6, 5, 4
+    W = torch.randn(12, nx, ny, nz, dtype=dtype)
+    L = torch.randint(0, 2, (12, nx, ny, nz), dtype=torch.long).to(dtype)
+
+    F_W = torch.fft.fftn(W, dim=(-3, -2, -1))
+    F_L = torch.fft.fftn(L, dim=(-3, -2, -1))
+    score_fft = torch.fft.ifftn(
+        (F_W * F_L.conj()).sum(dim=0), dim=(-3, -2, -1),
+    ).real
+
+    score_direct = docking_score_iface_direct(W, L)
+    assert torch.allclose(score_fft, score_direct, atol=1e-10, rtol=0)
+
+
+def test_iface_fft_matches_docking_score_elec_synthetic():
+    """FFT IFACE grid equals `docking_score_elec`'s IFACE term at
+    several in-bound translations (α=0, β=0, iface=nontrivial)."""
+    dtype = torch.float64
+    spacing = 3.0
+    sys = _synth_system(seed=3, N_rec=10, N_lig=6)
+    iface_matrix = torch.randn(12, 12, dtype=dtype, generator=torch.Generator().manual_seed(5))
+    iface_flat = iface_matrix.T.contiguous().view(-1)
+
+    _, _, xg, yg, zg = generate_grid(
+        sys["rec_xyz"], sys["lig_xyz"], spacing=spacing, dtype=dtype,
+    )
+    nx, ny, nz = xg.numel(), yg.numel(), zg.numel()
+
+    W = _build_receptor_iface_weighted_grids(
+        sys["rec_xyz"], sys["rec_atomtype_id"], iface_matrix, xg, yg, zg,
+        rcut_iface=6.0,
+    )
+    L = _build_ligand_iface_grid_single(
+        sys["lig_xyz"], sys["lig_atomtype_id"], xg, yg, zg,
+    )
+    F_W = torch.fft.fftn(W, dim=(-3, -2, -1))
+    F_L = torch.fft.fftn(L, dim=(-3, -2, -1))
+    score_iface_grid = torch.fft.ifftn(
+        (F_W * F_L.conj()).sum(dim=0), dim=(-3, -2, -1),
+    ).real
+
+    alpha = torch.tensor(0.0, dtype=dtype)
+    beta = torch.tensor(0.0, dtype=dtype)
+    charge = torch.zeros(11, dtype=dtype)
+
+    for t_cells in [(0, 0, 0), (1, 0, 0), (0, 1, 0), (-1, 0, 1), (-1, -1, 0)]:
+        t_ang = torch.tensor(
+            [t_cells[0] * spacing, t_cells[1] * spacing, t_cells[2] * spacing],
+            dtype=dtype,
+        )
+        pos = sys["lig_xyz"] + t_ang
+        if ((pos[:, 0] < xg[0]).any() or (pos[:, 0] > xg[-1]).any()
+            or (pos[:, 1] < yg[0]).any() or (pos[:, 1] > yg[-1]).any()
+            or (pos[:, 2] < zg[0]).any() or (pos[:, 2] > zg[-1]).any()):
+            continue
+        sc_e = docking_score_elec(
+            sys["rec_xyz"], sys["rec_radius"], sys["rec_sasa"],
+            sys["rec_atomtype_id"], sys["rec_charge_id"],
+            pos.unsqueeze(0), sys["lig_radius"], sys["lig_sasa"],
+            sys["lig_atomtype_id"], sys["lig_charge_id"],
+            alpha=alpha, iface_ij_flat=iface_flat, beta=beta, charge_score=charge,
+            lig_xyz_for_grid=sys["lig_xyz"], spacing=spacing,
+        ).item()
+        tx = t_cells[0] % nx
+        ty = t_cells[1] % ny
+        tz = t_cells[2] % nz
+        sc_fft = score_iface_grid[tx, ty, tz].item()
+        rel = abs(sc_e - sc_fft) / (abs(sc_e) + 1)
+        assert rel < 1e-12, f"t={t_cells}: elec={sc_e} fft={sc_fft}"
+
+
+# ---------------------------------------------------------------------------
+# V-ELEC: direct + elec cross-checks for the ELEC term (Coulomb mode)
+# ---------------------------------------------------------------------------
+
+
+def test_elec_fft_matches_direct_xcorr():
+    """FFT ELEC via `Re(ifft(fft(V) · conj(fft(Q))))` equals naive
+    O(V²) cross-correlation."""
+    torch.manual_seed(0)
+    dtype = torch.float64
+    nx, ny, nz = 8, 6, 5
+    V = torch.randn(nx, ny, nz, dtype=dtype)
+    Q = torch.randn(nx, ny, nz, dtype=dtype)
+    score_fft = torch.fft.ifftn(
+        torch.fft.fftn(V, dim=(-3, -2, -1))
+        * torch.fft.fftn(Q, dim=(-3, -2, -1)).conj(),
+        dim=(-3, -2, -1),
+    ).real
+    score_direct = docking_score_elec_direct(V, Q)
+    assert torch.allclose(score_fft, score_direct, atol=1e-10, rtol=0)
+
+
+def test_elec_fft_matches_docking_score_elec_synthetic():
+    """FFT ELEC grid equals `docking_score_elec`'s β·ELEC term at
+    several translations (α=0, iface=0, β=1, real-LUT charges)."""
+    dtype = torch.float64
+    spacing = 3.0
+    sys = _synth_system(seed=3, N_rec=10, N_lig=6)
+
+    charge_lut = default_charge_score_lut(dtype=dtype)
+    alpha = torch.tensor(0.0, dtype=dtype)
+    iface_flat = torch.zeros(144, dtype=dtype)
+    beta = torch.tensor(1.0, dtype=dtype)
+
+    _, _, xg, yg, zg = generate_grid(
+        sys["rec_xyz"], sys["lig_xyz"], spacing=spacing, dtype=dtype,
+    )
+    nx, ny, nz = xg.numel(), yg.numel(), zg.numel()
+    R_real, R_imag = _build_receptor_sc_grids(
+        sys["rec_xyz"], sys["rec_radius"], sys["rec_sasa"], xg, yg, zg,
+        surface_threshold=1.0,
+    )
+    V_rec = _build_receptor_elec_grid(
+        sys["rec_xyz"], sys["rec_charge_id"], charge_lut, R_real, R_imag,
+        xg, yg, zg, rcut_elec=8.0,
+    )
+    Q_L = _build_ligand_elec_grid_single(
+        sys["lig_xyz"], sys["lig_charge_id"], charge_lut, xg, yg, zg,
+    )
+    score_elec_grid = torch.fft.ifftn(
+        torch.fft.fftn(V_rec, dim=(-3, -2, -1))
+        * torch.fft.fftn(Q_L, dim=(-3, -2, -1)).conj(),
+        dim=(-3, -2, -1),
+    ).real
+
+    for t_cells in [(0, 0, 0), (1, 0, 0), (0, 1, 0), (-1, 0, 1), (-1, -1, 0)]:
+        t_ang = torch.tensor(
+            [t_cells[0] * spacing, t_cells[1] * spacing, t_cells[2] * spacing],
+            dtype=dtype,
+        )
+        pos = sys["lig_xyz"] + t_ang
+        if ((pos[:, 0] < xg[0]).any() or (pos[:, 0] > xg[-1]).any()
+            or (pos[:, 1] < yg[0]).any() or (pos[:, 1] > yg[-1]).any()
+            or (pos[:, 2] < zg[0]).any() or (pos[:, 2] > zg[-1]).any()):
+            continue
+        sc_e = docking_score_elec(
+            sys["rec_xyz"], sys["rec_radius"], sys["rec_sasa"],
+            sys["rec_atomtype_id"], sys["rec_charge_id"],
+            pos.unsqueeze(0), sys["lig_radius"], sys["lig_sasa"],
+            sys["lig_atomtype_id"], sys["lig_charge_id"],
+            alpha=alpha, iface_ij_flat=iface_flat, beta=beta,
+            charge_score=charge_lut,
+            lig_xyz_for_grid=sys["lig_xyz"], spacing=spacing,
+        ).item()
+        tx = t_cells[0] % nx
+        ty = t_cells[1] % ny
+        tz = t_cells[2] % nz
+        # beta = 1, so elec total = ELEC exactly
+        sc_fft = score_elec_grid[tx, ty, tz].item()
+        rel = abs(sc_e - sc_fft) / (abs(sc_e) + 1)
+        assert rel < 1e-12, f"t={t_cells}: elec={sc_e} fft={sc_fft}"
+
+
+# ---------------------------------------------------------------------------
+# V-FULL: combined α SC + IFACE + β ELEC vs docking_score_elec total
+# ---------------------------------------------------------------------------
+
+
+def _full_score_grid(rec, lig, alpha, iface_flat, beta, charge_lut,
+                      spacing, dtype):
+    """Compute the full (nx, ny, nz) score grid at identity rotation by
+    running `docking_search`'s inner FFT pipeline directly. Used by
+    V-FULL for deterministic per-cell lookup (bypasses top-N)."""
+    _, _, xg, yg, zg = generate_grid(
+        rec["xyz"], lig["xyz"], spacing=spacing, dtype=dtype,
+    )
+    nx, ny, nz = xg.numel(), yg.numel(), zg.numel()
+    R_real, R_imag = _build_receptor_sc_grids(
+        rec["xyz"], rec["radius"], rec["sasa"], xg, yg, zg, surface_threshold=1.0,
+    )
+    iface_matrix = iface_flat.view(12, 12).T
+    W = _build_receptor_iface_weighted_grids(
+        rec["xyz"], rec["atomtype_id"], iface_matrix, xg, yg, zg, rcut_iface=6.0,
+    )
+    V_rec = _build_receptor_elec_grid(
+        rec["xyz"], rec["charge_id"], charge_lut, R_real, R_imag,
+        xg, yg, zg, rcut_elec=8.0,
+    )
+    lig_surf = lig["sasa"] > 1.0
+    L_sc_real, L_sc_imag = _build_ligand_sc_grid_single(
+        lig["xyz"], lig["radius"], lig_surf, xg, yg, zg,
+    )
+    L_iface = _build_ligand_iface_grid_single(
+        lig["xyz"], lig["atomtype_id"], xg, yg, zg,
+    )
+    L_elec = _build_ligand_elec_grid_single(
+        lig["xyz"], lig["charge_id"], charge_lut, xg, yg, zg,
+    )
+    Z_R = (R_real + 1j * R_imag).to(torch.complex128)
+    Z_L = (L_sc_real + 1j * L_sc_imag).to(torch.complex128)
+    G_sc = torch.fft.ifftn(
+        torch.fft.fftn(Z_R, dim=(-3, -2, -1))
+        * torch.fft.fftn(Z_L.conj(), dim=(-3, -2, -1)).conj(),
+        dim=(-3, -2, -1),
+    )
+    score_sc = G_sc.real - G_sc.imag
+    score_iface = torch.fft.ifftn(
+        (torch.fft.fftn(W, dim=(-3, -2, -1))
+         * torch.fft.fftn(L_iface, dim=(-3, -2, -1)).conj()).sum(dim=0),
+        dim=(-3, -2, -1),
+    ).real
+    score_elec = torch.fft.ifftn(
+        torch.fft.fftn(V_rec, dim=(-3, -2, -1))
+        * torch.fft.fftn(L_elec, dim=(-3, -2, -1)).conj(),
+        dim=(-3, -2, -1),
+    ).real
+    return alpha * score_sc + score_iface + beta * score_elec, (xg, yg, zg)
+
+
+def test_full_fft_matches_elec_1kxq_julia_defaults(refs_root):
+    """On 1KXQ phase-5 refs (3908 rec × 916 lig × 117×115×129 grid),
+    `docking_search`'s full score grid matches `docking_score_elec`
+    bit-exactly (relative diff < 1e-10) with Julia-default parameters
+    (α=0.01, β=3.0, iface and charge from LUT)."""
+    import h5py
+    dtype = torch.float64
+    spacing = 1.2
+    path = refs_root / "phase5_scores.h5"
+    with h5py.File(path, "r") as f:
+        rec = dict(
+            xyz=torch.from_numpy(np.array(f["rec_xyz"], dtype=np.float64)).T.contiguous(),
+            radius=torch.from_numpy(np.array(f["rec_radius"], dtype=np.float64)),
+            sasa=torch.from_numpy(np.array(f["rec_sasa"], dtype=np.float64)),
+            atomtype_id=torch.from_numpy(np.array(f["rec_atomtype_id"], dtype=np.int64)),
+            charge_id=torch.from_numpy(np.array(f["rec_charge_id"], dtype=np.int64)),
+        )
+        lig = dict(
+            xyz=torch.from_numpy(np.array(f["lig_xyz_for_grid"], dtype=np.float64)).T.contiguous(),
+            radius=torch.from_numpy(np.array(f["lig_radius"], dtype=np.float64)),
+            sasa=torch.from_numpy(np.array(f["lig_sasa"], dtype=np.float64)),
+            atomtype_id=torch.from_numpy(np.array(f["lig_atomtype_id"], dtype=np.int64)),
+            charge_id=torch.from_numpy(np.array(f["lig_charge_id"], dtype=np.int64)),
+        )
+        alpha = torch.tensor(float(f["alpha"][()]), dtype=dtype)
+        beta = torch.tensor(float(f["beta"][()]), dtype=dtype)
+        iface_flat = torch.from_numpy(np.array(f["iface_ij_flat"], dtype=np.float64))
+        charge_lut = torch.from_numpy(np.array(f["charge_score"], dtype=np.float64))
+
+    score_grid, (xg, yg, zg) = _full_score_grid(
+        rec, lig, alpha, iface_flat, beta, charge_lut, spacing, dtype,
+    )
+    nx, ny, nz = xg.numel(), yg.numel(), zg.numel()
+
+    for t in [
+        (0.0, 0.0, 0.0),
+        (spacing, 0.0, 0.0),
+        (0.0, spacing, 0.0),
+        (0.0, 0.0, spacing),
+        (-spacing, spacing, -spacing),
+    ]:
+        t_ang = torch.tensor(t, dtype=dtype)
+        lig_pose = (lig["xyz"] + t_ang).unsqueeze(0)
+        tot_e = docking_score_elec(
+            rec["xyz"], rec["radius"], rec["sasa"], rec["atomtype_id"],
+            rec["charge_id"],
+            lig_pose, lig["radius"], lig["sasa"], lig["atomtype_id"],
+            lig["charge_id"],
+            alpha=alpha, iface_ij_flat=iface_flat, beta=beta, charge_score=charge_lut,
+            lig_xyz_for_grid=lig["xyz"], spacing=spacing,
+        ).item()
+        tx = int(round(t[0] / spacing)) % nx
+        ty = int(round(t[1] / spacing)) % ny
+        tz = int(round(t[2] / spacing)) % nz
+        tot_fft = score_grid[tx, ty, tz].item()
+        rel = abs(tot_e - tot_fft) / (abs(tot_e) + 1)
+        assert rel < 1e-10, f"t={t}: elec={tot_e} fft={tot_fft}"
+
+
+def test_docking_search_returns_correct_top1(sc_only_params):
+    """`docking_search` (full score) at identity rotation returns a
+    top-ranked pose whose decoded (q, t) reproduces the same score
+    when fed back through `docking_score_elec`. Synthetic system."""
+    dtype = torch.float64
+    spacing = 3.0
+    sys = _synth_system(seed=3, N_rec=10, N_lig=6)
+
+    iface_matrix = torch.randn(12, 12, dtype=dtype,
+                               generator=torch.Generator().manual_seed(5))
+    iface_flat = iface_matrix.T.contiguous().view(-1)
+    charge_lut = default_charge_score_lut(dtype=dtype)
+    alpha = torch.tensor(0.01, dtype=dtype)
+    beta = torch.tensor(3.0, dtype=dtype)
+    q_id = torch.tensor([[0.0, 0.0, 0.0, 1.0]], dtype=dtype)
+
+    result = docking_search(
+        sys["rec_xyz"], sys["rec_radius"], sys["rec_sasa"],
+        sys["rec_atomtype_id"], sys["rec_charge_id"],
+        sys["lig_xyz"], sys["lig_radius"], sys["lig_sasa"],
+        sys["lig_atomtype_id"], sys["lig_charge_id"],
+        quaternions=q_id,
+        alpha=alpha, iface_ij_flat=iface_flat, beta=beta,
+        charge_score_lut=charge_lut,
+        spacing=spacing, ntop=50, rot_chunk_size=1,
+    )
+
+    # For top-ranked pose, recompute via docking_score_elec and require match
+    top_t = result.translations[0]
+    lig_pose = (sys["lig_xyz"] + top_t).unsqueeze(0)
+    tot_e = docking_score_elec(
+        sys["rec_xyz"], sys["rec_radius"], sys["rec_sasa"],
+        sys["rec_atomtype_id"], sys["rec_charge_id"],
+        lig_pose, sys["lig_radius"], sys["lig_sasa"],
+        sys["lig_atomtype_id"], sys["lig_charge_id"],
+        alpha=alpha, iface_ij_flat=iface_flat, beta=beta,
+        charge_score=charge_lut,
+        lig_xyz_for_grid=sys["lig_xyz"], spacing=spacing,
+    ).item()
+    tot_fft = result.scores[0].item()
+    rel = abs(tot_e - tot_fft) / (abs(tot_e) + 1)
+    assert rel < 1e-10, f"top-1: elec={tot_e} fft={tot_fft}"
+
+
+# ---------------------------------------------------------------------------
+# V-1KXQ-SC: real 1KXQ, SC-only (kept for historical bisection)
 # ---------------------------------------------------------------------------
 
 

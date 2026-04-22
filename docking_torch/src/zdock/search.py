@@ -35,12 +35,15 @@ import torch
 
 import math
 
+from .atomtypes import partial_charge_per_atom
 from .geom import generate_grid
 from .score import (
     _assign_sc_plus,
     _assign_sc_minus,
+    _grouped_spread_nearest_add,
     _grouped_spread_neighbors_add,
 )
+from .spread import spread_neighbors_coulomb
 
 
 @dataclass
@@ -237,8 +240,346 @@ def _unshift_cyclic(idx: torch.Tensor, N: int) -> torch.Tensor:
 
 
 # ---------------------------------------------------------------------------
+# IFACE term — 12 atom types × 12, precompute weighted receptor, per-rot
+# binary ligand scatter.
+# ---------------------------------------------------------------------------
+
+
+def _build_receptor_iface_weighted_grids(
+    rec_xyz: torch.Tensor,
+    rec_atomtype_id: torch.Tensor,      # (N_rec,) int in [1, 12]
+    iface_matrix: torch.Tensor,         # (12, 12)
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    z_grid: torch.Tensor,
+    *,
+    rcut_iface: float = 6.0,
+) -> torch.Tensor:
+    """Precompute ``W_i[cell] = Σ_j iface_ij[i, j] · H_j[cell]`` for
+    i = 0..11 (= ligand atom type − 1). Returns (12, nx, ny, nz).
+
+    ``H_j[cell]`` is the count of type-j receptor atoms within
+    ``rcut_iface`` of that cell — matches the ``H`` tensor built inline
+    in ``docking_score_elec``. Applying ``iface_matrix`` on the
+    receptor side via linearity lets the per-rotation FFT product be
+    just (F_L_i · F_W_i), summed over i after IFFT.
+    """
+    nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
+    device = rec_xyz.device
+    dtype = rec_xyz.dtype
+    H = torch.zeros((12, nx, ny, nz), device=device, dtype=dtype)
+    rec_group = (rec_atomtype_id - 1).to(torch.long).clamp(0, 11)
+    ones = torch.ones(rec_xyz.shape[0], device=device, dtype=dtype)
+    _grouped_spread_neighbors_add(
+        H, rec_xyz, rec_group, ones, rcut_iface,
+        x_grid, y_grid, z_grid,
+    )
+    # W[i] = Σ_j iface_matrix[i, j] · H[j]
+    W = torch.einsum("ij,jxyz->ixyz", iface_matrix, H)
+    return W
+
+
+def _build_ligand_iface_grid_single(
+    lig_xyz: torch.Tensor,              # (N_lig, 3)
+    lig_atomtype_id: torch.Tensor,      # (N_lig,) int in [1, 12]
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    z_grid: torch.Tensor,
+) -> torch.Tensor:
+    """Replicate ``docking_score_elec``'s ligand IFACE construction
+    (score.py lines 319-326): nearest-cell scatter grouped by atom
+    type, then ``(count > 0)`` binary indicator. Returns (12, nx, ny, nz).
+    """
+    nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
+    device = lig_xyz.device
+    dtype = lig_xyz.dtype
+    count = torch.zeros((12, nx, ny, nz), device=device, dtype=dtype)
+    lig_group = (lig_atomtype_id - 1).to(torch.long).clamp(0, 11)
+    ones = torch.ones(lig_xyz.shape[0], device=device, dtype=dtype)
+    _grouped_spread_nearest_add(
+        count, lig_xyz, lig_group, ones, x_grid, y_grid, z_grid,
+    )
+    return (count > 0).to(dtype)
+
+
+# ---------------------------------------------------------------------------
+# ELEC term (Coulomb mode) — receptor V grid (with core zeroing), per-rot
+# ligand charge grid.
+# ---------------------------------------------------------------------------
+
+
+def _build_receptor_elec_grid(
+    rec_xyz: torch.Tensor,
+    rec_charge_id: torch.Tensor,
+    charge_score_lut: torch.Tensor,     # (11,) learnable charge LUT
+    R_real: torch.Tensor,               # SC real grid for core mask
+    R_imag: torch.Tensor,               # SC imag grid for core mask
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    z_grid: torch.Tensor,
+    *,
+    rcut_elec: float = 8.0,
+) -> torch.Tensor:
+    """Coulomb-mode receptor potential grid matching
+    ``docking_score_elec`` (score.py lines 454-467). V[cell] = Σ_j
+    q_j / |cell − r_j|, zeroed inside the receptor SC shape (Chen 2002
+    §2.2). Returns (nx, ny, nz) real.
+    """
+    nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
+    device = rec_xyz.device
+    dtype = rec_xyz.dtype
+    rec_q = partial_charge_per_atom(rec_charge_id, charge_score_lut)
+    V = torch.zeros((nx, ny, nz), device=device, dtype=dtype)
+    spread_neighbors_coulomb(
+        V, rec_xyz, rec_q, rcut_elec, x_grid, y_grid, z_grid,
+    )
+    open_mask = ((R_real == 0) & (R_imag == 0)).to(dtype)
+    return V * open_mask
+
+
+def _build_ligand_elec_grid_single(
+    lig_xyz: torch.Tensor,
+    lig_charge_id: torch.Tensor,
+    charge_score_lut: torch.Tensor,
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    z_grid: torch.Tensor,
+) -> torch.Tensor:
+    """Ligand partial-charge grid: nearest-cell scatter of each atom's
+    partial charge q_i. Matches ``docking_score_elec`` (score.py lines
+    330-340). Returns (nx, ny, nz) real.
+    """
+    nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
+    device = lig_xyz.device
+    dtype = lig_xyz.dtype
+    lig_q = partial_charge_per_atom(lig_charge_id, charge_score_lut)
+    # _grouped_spread_nearest_add requires grouping; use a single-group
+    # (group=0) view and collect into a 1-slab grid.
+    grid = torch.zeros((1, nx, ny, nz), device=device, dtype=dtype)
+    group = torch.zeros(lig_xyz.shape[0], device=device, dtype=torch.long)
+    _grouped_spread_nearest_add(
+        grid, lig_xyz, group, lig_q, x_grid, y_grid, z_grid,
+    )
+    return grid[0]
+
+
+# ---------------------------------------------------------------------------
+# Direct (non-FFT) per-term scores for tests. O(V²) per translation, so
+# only usable on tiny grids. One function per term plus a full-stack
+# composer, all producing the same (nx, ny, nz) cyclic-DFT indexed grid
+# that docking_search_* returns.
+# ---------------------------------------------------------------------------
+
+
+def docking_score_iface_direct(
+    W_i: torch.Tensor,              # (12, nx, ny, nz)
+    L_i: torch.Tensor,              # (12, nx, ny, nz)
+) -> torch.Tensor:
+    """Naive IFACE cross-correlation: `Σ_i Σ_cell W_i[cell] · L_i[cell − t]`
+    for every translation t. O(V² · 12) per translation — tiny grids only.
+    """
+    nx, ny, nz = W_i.shape[-3:]
+    out = torch.zeros((nx, ny, nz), device=W_i.device, dtype=W_i.dtype)
+    for tx in range(nx):
+        for ty in range(ny):
+            for tz in range(nz):
+                Ls = torch.roll(L_i, shifts=(tx, ty, tz), dims=(-3, -2, -1))
+                out[tx, ty, tz] = (W_i * Ls).sum()
+    return out
+
+
+def docking_score_elec_direct(
+    V_rec: torch.Tensor,            # (nx, ny, nz)
+    Q_L: torch.Tensor,              # (nx, ny, nz)
+) -> torch.Tensor:
+    """Naive ELEC cross-correlation: `Σ_cell V_rec[cell] · Q_L[cell − t]`."""
+    nx, ny, nz = V_rec.shape
+    out = torch.zeros_like(V_rec)
+    for tx in range(nx):
+        for ty in range(ny):
+            for tz in range(nz):
+                Qs = torch.roll(Q_L, shifts=(tx, ty, tz), dims=(0, 1, 2))
+                out[tx, ty, tz] = (V_rec * Qs).sum()
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Top-level search API
 # ---------------------------------------------------------------------------
+
+
+def docking_search(
+    rec_xyz: torch.Tensor,
+    rec_radius: torch.Tensor,
+    rec_sasa: torch.Tensor,
+    rec_atomtype_id: torch.Tensor,
+    rec_charge_id: torch.Tensor,
+    lig_xyz_ref: torch.Tensor,
+    lig_radius: torch.Tensor,
+    lig_sasa: torch.Tensor,
+    lig_atomtype_id: torch.Tensor,
+    lig_charge_id: torch.Tensor,
+    quaternions: torch.Tensor,
+    *,
+    alpha: torch.Tensor,
+    iface_ij_flat: torch.Tensor,    # (144,) — docking_score_elec convention
+    beta: torch.Tensor,
+    charge_score_lut: torch.Tensor, # (11,) partial charge LUT
+    spacing: float = 3.0,
+    surface_threshold: float = 1.0,
+    rcut_iface: float = 6.0,
+    rcut_elec: float = 8.0,
+    ntop: int = 2000,
+    rot_chunk_size: int = 16,
+) -> DockingResultSC:
+    """Full-score FFT docking search matching ``docking_score_elec``.
+
+    For each quaternion, evaluates
+
+        score(t) = α · SC(t) + IFACE(t) + β · ELEC(t)
+
+    at every translation cell in one batched FFT, where SC/IFACE/ELEC
+    reproduce ``docking_score_elec`` bit-exactly (modulo float
+    roundoff). Keeps top-``ntop`` (quaternion, translation) pairs
+    across all rotations.
+
+    Receptor-side precomputes: complex SC grid, 12 weighted IFACE
+    grids W_i, 1 Coulomb V_rec grid (with receptor-core zeroing). All
+    FFT'd once before the rotation loop.
+
+    Per rotation (batched in chunks of ``rot_chunk_size``):
+        * SC: 1 complex FFT pair
+        * IFACE: 12 real FFT pairs (sum before IFFT)
+        * ELEC: 1 real FFT pair
+    Total 14 FFTs per rotation + precompute.
+    """
+    device = rec_xyz.device
+    dtype = rec_xyz.dtype
+    n_rot = quaternions.shape[0]
+
+    # Grid axes — match docking_score_elec exactly (same call).
+    _, _, x_grid, y_grid, z_grid = generate_grid(
+        rec_xyz, lig_xyz_ref, spacing=spacing, device=device, dtype=dtype,
+    )
+    nx, ny, nz = x_grid.numel(), y_grid.numel(), z_grid.numel()
+    V = nx * ny * nz
+
+    # Receptor SC complex grid (+ FFT) — also needed for ELEC core mask.
+    R_real, R_imag = _build_receptor_sc_grids(
+        rec_xyz, rec_radius, rec_sasa, x_grid, y_grid, z_grid,
+        surface_threshold=surface_threshold,
+    )
+    complex_dtype = torch.complex64 if dtype == torch.float32 else torch.complex128
+    Z_R = (R_real + 1j * R_imag).to(complex_dtype)
+    F_Z_R = torch.fft.fftn(Z_R, dim=(-3, -2, -1))
+
+    # Receptor IFACE (12 W_i grids, pre-weighted by iface_matrix).
+    # iface_ij_flat → (12,12) matching docking_score_elec line 413.
+    iface_matrix = iface_ij_flat.view(12, 12).T
+    W = _build_receptor_iface_weighted_grids(
+        rec_xyz, rec_atomtype_id, iface_matrix, x_grid, y_grid, z_grid,
+        rcut_iface=rcut_iface,
+    )
+    F_W = torch.fft.fftn(W, dim=(-3, -2, -1))         # (12, nx, ny, nz) complex
+
+    # Receptor ELEC potential V_rec (Coulomb + core zero).
+    V_rec = _build_receptor_elec_grid(
+        rec_xyz, rec_charge_id, charge_score_lut, R_real, R_imag,
+        x_grid, y_grid, z_grid, rcut_elec=rcut_elec,
+    )
+    F_V = torch.fft.fftn(V_rec, dim=(-3, -2, -1))
+
+    # Running top-ntop buffer.
+    buf_scores = torch.full((ntop,), float("-inf"), device=device, dtype=dtype)
+    buf_quat = torch.zeros((ntop,), device=device, dtype=torch.long)
+    buf_flat = torch.zeros((ntop,), device=device, dtype=torch.long)
+
+    # Precompute ligand partial charges (scalars per atom — rotation-invariant).
+    lig_partial_q = partial_charge_per_atom(lig_charge_id, charge_score_lut)
+    lig_surf = lig_sasa > surface_threshold
+
+    for chunk_start in range(0, n_rot, rot_chunk_size):
+        chunk_end = min(chunk_start + rot_chunk_size, n_rot)
+        B = chunk_end - chunk_start
+
+        lig_rot = _rotate_batch(
+            lig_xyz_ref, quaternions[chunk_start:chunk_end],
+        )  # (B, N_lig, 3)
+
+        # Allocate per-rotation ligand grids.
+        L_sc_real = torch.zeros((B, nx, ny, nz), device=device, dtype=dtype)
+        L_sc_imag = torch.zeros((B, nx, ny, nz), device=device, dtype=dtype)
+        L_iface = torch.zeros((B, 12, nx, ny, nz), device=device, dtype=dtype)
+        L_elec = torch.zeros((B, nx, ny, nz), device=device, dtype=dtype)
+
+        # Per-rotation scatter (phase-1 loop style; phase-3 optimisation
+        # target).
+        for b in range(B):
+            Lr, Li = _build_ligand_sc_grid_single(
+                lig_rot[b], lig_radius, lig_surf, x_grid, y_grid, z_grid,
+            )
+            L_sc_real[b] = Lr
+            L_sc_imag[b] = Li
+            L_iface[b] = _build_ligand_iface_grid_single(
+                lig_rot[b], lig_atomtype_id, x_grid, y_grid, z_grid,
+            )
+            L_elec[b] = _build_ligand_elec_grid_single(
+                lig_rot[b], lig_charge_id, charge_score_lut,
+                x_grid, y_grid, z_grid,
+            )
+
+        # SC: complex FFT, real − imag.
+        Z_L = (L_sc_real + 1j * L_sc_imag).to(complex_dtype)
+        F_Z_L = torch.fft.fftn(Z_L.conj(), dim=(-3, -2, -1)).conj()
+        G_sc = torch.fft.ifftn(F_Z_R.unsqueeze(0) * F_Z_L, dim=(-3, -2, -1))
+        score_sc = G_sc.real - G_sc.imag             # (B, nx, ny, nz)
+
+        # IFACE: 12 real FFTs, sum in frequency domain, single IFFT.
+        F_L_iface = torch.fft.fftn(L_iface, dim=(-3, -2, -1))  # (B, 12, .)
+        # Σ_i F_W[i] · conj(F_L_iface[b, i])
+        summed = (F_W.unsqueeze(0) * F_L_iface.conj()).sum(dim=1)
+        score_iface = torch.fft.ifftn(summed, dim=(-3, -2, -1)).real
+
+        # ELEC: 1 real FFT pair.
+        F_L_elec = torch.fft.fftn(L_elec, dim=(-3, -2, -1))
+        score_elec = torch.fft.ifftn(
+            F_V.unsqueeze(0) * F_L_elec.conj(), dim=(-3, -2, -1),
+        ).real
+
+        # Combine per docking_score_elec: α SC + IFACE + β ELEC.
+        score_grid = alpha * score_sc + score_iface + beta * score_elec
+
+        # Top-k per rotation then merge with buffer.
+        score_flat = score_grid.reshape(B, -1)
+        k_per_rot = min(ntop, score_flat.shape[1])
+        top_vals, top_idx = torch.topk(score_flat, k=k_per_rot, dim=1)
+        cand_scores = top_vals.reshape(-1)
+        cand_quat = (
+            chunk_start
+            + torch.arange(B, device=device).unsqueeze(-1).expand(-1, k_per_rot)
+        ).reshape(-1).to(torch.long)
+        cand_flat = top_idx.reshape(-1).to(torch.long)
+
+        all_scores = torch.cat([buf_scores, cand_scores])
+        all_quat = torch.cat([buf_quat, cand_quat])
+        all_flat = torch.cat([buf_flat, cand_flat])
+        new_vals, new_idx = torch.topk(all_scores, k=ntop)
+        buf_scores = new_vals
+        buf_quat = all_quat[new_idx]
+        buf_flat = all_flat[new_idx]
+
+    tz = buf_flat % nz
+    ty = (buf_flat // nz) % ny
+    tx = (buf_flat // (ny * nz)) % nx
+    tx_s = _unshift_cyclic(tx, nx).to(dtype) * spacing
+    ty_s = _unshift_cyclic(ty, ny).to(dtype) * spacing
+    tz_s = _unshift_cyclic(tz, nz).to(dtype) * spacing
+
+    return DockingResultSC(
+        scores=buf_scores,
+        quat_indices=buf_quat,
+        translations=torch.stack([tx_s, ty_s, tz_s], dim=-1),
+    )
 
 
 def docking_search_sc(
