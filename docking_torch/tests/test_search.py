@@ -673,6 +673,55 @@ def test_docking_search_returns_correct_top1(sc_only_params):
 # ---------------------------------------------------------------------------
 
 
+# ---------------------------------------------------------------------------
+# V-autograd: differentiability through the FFT search
+# ---------------------------------------------------------------------------
+
+
+def test_docking_search_autograd_smoke():
+    """`docking_search` is end-to-end differentiable: backprop through
+    the FFT path to the learnable parameters (α, iface, β, charge_lut)
+    produces non-NaN gradients. This guards the door for a future
+    end-to-end differentiable search-and-train experiment — topk is
+    sparse-gradient, so only some params get nonzero grads, but none
+    should NaN out."""
+    dtype = torch.float64
+    spacing = 3.0
+    sys = _synth_system(seed=3, N_rec=10, N_lig=6)
+
+    alpha = torch.tensor(0.01, dtype=dtype, requires_grad=True)
+    iface_flat = torch.randn(
+        144, dtype=dtype,
+        generator=torch.Generator().manual_seed(5),
+    ).requires_grad_(True)
+    beta = torch.tensor(3.0, dtype=dtype, requires_grad=True)
+    charge_lut = default_charge_score_lut(dtype=dtype).clone().requires_grad_(True)
+
+    q_id = torch.tensor([[0.0, 0.0, 0.0, 1.0]], dtype=dtype)
+    result = docking_search(
+        sys["rec_xyz"], sys["rec_radius"], sys["rec_sasa"],
+        sys["rec_atomtype_id"], sys["rec_charge_id"],
+        sys["lig_xyz"], sys["lig_radius"], sys["lig_sasa"],
+        sys["lig_atomtype_id"], sys["lig_charge_id"],
+        quaternions=q_id,
+        alpha=alpha, iface_ij_flat=iface_flat, beta=beta,
+        charge_score_lut=charge_lut,
+        spacing=spacing, ntop=20, rot_chunk_size=1,
+    )
+    # topk is sparse in the grid axes, but for learnable scalars that
+    # linearly scale every grid cell of a term, every top-k pose's
+    # score has a nonzero ∂/∂alpha and ∂/∂beta.
+    result.scores.sum().backward()
+
+    assert alpha.grad is not None and not torch.isnan(alpha.grad).any()
+    assert beta.grad is not None and not torch.isnan(beta.grad).any()
+    assert iface_flat.grad is not None and not torch.isnan(iface_flat.grad).any()
+    assert charge_lut.grad is not None and not torch.isnan(charge_lut.grad).any()
+    # alpha and beta are scalars times a nonzero score — expect nonzero grad
+    assert alpha.grad.abs().item() > 0
+    assert beta.grad.abs().item() > 0
+
+
 def test_sc_fft_matches_elec_1kxq(refs_root, sc_only_params):
     """Real 3908-atom receptor × 916-atom ligand (1KXQ phase-5 refs):
     FFT SC score at several translations matches `docking_score_elec`'s

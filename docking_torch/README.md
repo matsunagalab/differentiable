@@ -13,7 +13,13 @@ list.
 - **Pure PyTorch** — NumPy and h5py are only for reference I/O
 - **Same code runs on macOS (MPS) and Linux (CUDA)** out of the box
 - Numerical agreement with the Julia reference is guaranteed by pytest
-  (all 58 tests green on CPU + MPS; training and physics tests included)
+  (all 82 tests green on CPU + MPS; training, physics, and FFT search
+  tests included)
+- **FFT-based docking pose search** (`zdock.search.docking_search`)
+  evaluates every translation of the ligand at fixed rotation in one
+  batched FFT — the same math as the upstream ZDOCK Fortran binary
+  but end-to-end PyTorch / autograd-safe. See `PORT_PLAN_FFT.md` for
+  the Julia-reference audit that preceded the port.
 - PyTorch autograd replaces the buggy hand-written `rrule` in Julia
 - Per-frame work is fused into a single einsum for GPU-friendly batching
 - **Physically correct Coulombic electrostatics** by default
@@ -452,7 +458,9 @@ docking_torch/
 │   ├── data.py             ← list_proteins / load_training_dataset
 │   │                         (consolidated BM4 HDF5 reader)
 │   ├── io.py               ← PDB / .ms / rmsds readers for dataset build
-│   └── zdock_output.py     ← ZDOCK `.out` + `create_lig` Python port
+│   ├── zdock_output.py     ← ZDOCK `.out` + `create_lig` Python port
+│   ├── search.py           ← FFT-based docking search (`docking_search`)
+│   └── rotation_grid.py    ← random / Euler-grid quaternion samplers
 └── tests/                  ← 58 tests: numerical parity with Julia,
                               SASA / SVD / autograd / train / physics
 ```
@@ -536,6 +544,49 @@ only used when `--loss rank`; default 5.0 — sweep
 Output: `out/trained_params.pt` with the learned parameters, loss
 history, the selected lr, the full grid results, and the exact
 `train_proteins` / `val_proteins` / `test_proteins` split used.
+
+### (2b) FFT docking search — `examples/04_fft_docking.py`
+
+Pose **generation** in pure PyTorch, without the C/Fortran ZDOCK
+binary. For each of N sampled rotations the FFT evaluates
+`α S_SC + S_IFACE + β S_ELEC` at every translation cell in one batched
+FFT pair, then returns the top-K (rotation, translation) poses. This
+is the same function that `docking_score_elec` computes at a single
+pose — the FFT path has been verified bit-exact against it (max
+relative diff ~5 × 10⁻¹⁵ on float64 / 1KXQ).
+
+```bash
+# 64 random rotations, ~5 s on CUDA, ~3.5 min on CPU
+uv run python examples/04_fft_docking.py
+
+# Bigger rotation set on CUDA
+CUDA_VISIBLE_DEVICES=0 uv run python examples/04_fft_docking.py \
+    --device cuda --n-rotations 1024
+
+# On Apple Silicon
+uv run python examples/04_fft_docking.py --device mps --n-rotations 128
+```
+
+Output: `out/04_fft_docking_top.txt` — a table of the top-K
+`(score, quat_idx, translation)` tuples. The script also re-scores
+every reported pose via `docking_score_elec` and reports the maximum
+relative diff; a pass threshold of ~10⁻¹⁰ on float64 / 10⁻⁴ on float32
+is built in.
+
+Low-level API — `zdock.search.docking_search(...)` takes the same
+10-field receptor/ligand bundle as `docking_score_elec`, a rotation
+grid `quaternions: (R, 4)`, and the learnable parameters `alpha /
+iface_ij_flat / beta / charge_score_lut`. Returns a `DockingResultSC`
+dataclass with `.scores (ntop,) .quat_indices (ntop,) .translations
+(ntop, 3)`. Rotation grids can be produced via
+`zdock.rotation_grid.random_quaternions(n, seed=…)` or
+`euler_quaternions(deg=…)` — exact ZDOCK-table compatibility is
+future work (see `PORT_PLAN_FFT.md`).
+
+The search is end-to-end differentiable: `result.scores.sum().backward()`
+propagates through the FFT to `alpha / iface / beta / charge_score_lut`
+without NaN. Sparse gradient through `torch.topk`, so only poses in
+the retained top-N contribute.
 
 ### (3) Evaluate the held-out test split — `examples/03_evaluate.py`
 
