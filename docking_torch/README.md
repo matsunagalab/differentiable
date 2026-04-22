@@ -609,6 +609,14 @@ uv run python examples/05_fft_generate_decoys.py --device cuda
 # ZDOCK-comparable ~54k rotations (6° Euler), trained params
 uv run python examples/05_fft_generate_decoys.py --device cuda \
     --euler-deg 6.0 --params-ckpt out/trained_params_rank.pt
+
+# Parallelise across 4 GPUs — dynamic 1-complex-per-GPU pool.
+# Proteins are dispatched to whichever GPU becomes free next, so
+# no upfront chunk imbalance; each GPU processes one complex at a
+# time with CUDA_VISIBLE_DEVICES isolation and per-worker tmp h5s
+# that are merged into --out at the end.
+uv run python examples/05_fft_generate_decoys.py \
+    --gpus 0,1,2,3 --n-rotations 4096
 ```
 
 Output layout (per protein group):

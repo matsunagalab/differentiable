@@ -43,6 +43,9 @@ Examples:
 from __future__ import annotations
 
 import argparse
+import os
+import subprocess
+import sys
 import time
 from pathlib import Path
 
@@ -220,6 +223,160 @@ def run_one_protein(
     return out
 
 
+def _merge_h5(
+    tmp_files: list[Path], out_path: Path, root_attrs: dict,
+) -> int:
+    """Copy every protein group from each tmp file into `out_path`.
+    Returns the total number of protein groups written.
+    """
+    written = 0
+    with h5py.File(out_path, "a") as h5_out:
+        for k, v in root_attrs.items():
+            h5_out.attrs[k] = v
+        for tmp in tmp_files:
+            if not tmp.exists():
+                continue
+            with h5py.File(tmp, "r") as h5_in:
+                for prot in h5_in:
+                    if prot in h5_out:
+                        del h5_out[prot]
+                    h5_in.copy(prot, h5_out)
+                    written += 1
+    return written
+
+
+def dispatch_multi_gpu(args: argparse.Namespace) -> None:
+    """Dynamic 1-complex-per-GPU worker pool.
+
+    Each GPU runs at most one complex at a time in its own subprocess
+    (with `CUDA_VISIBLE_DEVICES` pinned to that GPU). When a
+    subprocess finishes, the next pending protein is immediately
+    dispatched to that now-idle GPU. This keeps all GPUs saturated
+    until the last complex without needing an upfront chunk split,
+    so runtime skew across complexes doesn't idle half the pool.
+
+    Each per-complex subprocess writes to its own tmp h5; a final
+    merge pass concatenates them into `args.out`.
+    """
+    if not args.h5.exists():
+        raise SystemExit(f"input h5 not found: {args.h5}")
+
+    gpus = [g.strip() for g in args.gpus.split(",") if g.strip()]
+    if not gpus:
+        raise SystemExit("--gpus must list at least one GPU index")
+
+    all_names = list_proteins(args.h5)
+    names = args.proteins if args.proteins else all_names
+    missing = [p for p in names if p not in all_names]
+    if missing:
+        raise SystemExit(f"proteins not in {args.h5}: {missing}")
+
+    print(f"dispatching {len(names)} proteins across {len(gpus)} GPUs "
+          f"(1 complex / 1 GPU, dynamic assignment)")
+
+    # Strip --gpus / --device / --out / --proteins from the parent argv;
+    # the rest (--n-rotations, --params-ckpt, etc.) is passed through.
+    drop_flags_1 = {"--gpus", "--device", "--out"}
+    drop_flags_multi = {"--proteins"}
+    base_argv: list[str] = []
+    i = 1
+    while i < len(sys.argv):
+        a = sys.argv[i]
+        if a in drop_flags_1:
+            i += 2
+            continue
+        if a in drop_flags_multi:
+            i += 1
+            while i < len(sys.argv) and not sys.argv[i].startswith("--"):
+                i += 1
+            continue
+        base_argv.append(a)
+        i += 1
+
+    args.out.parent.mkdir(parents=True, exist_ok=True)
+
+    pending: list[str] = list(names)
+    # active[gpu] = (protein, Popen, tmp_path, start_time) or None
+    active: dict[str, tuple | None] = {g: None for g in gpus}
+    tmp_files: list[Path] = []
+    done: int = 0
+    failed: list[str] = []
+    total_start = time.time()
+
+    def launch(gpu: str, protein: str) -> tuple:
+        tmp = args.out.with_suffix(f".{protein}.h5.tmp")
+        if tmp.exists():
+            tmp.unlink()
+        child = [sys.executable, sys.argv[0]] + base_argv + [
+            "--device", "cuda",
+            "--out", str(tmp),
+            "--proteins", protein,
+        ]
+        env = {**os.environ, "CUDA_VISIBLE_DEVICES": gpu}
+        t0 = time.time()
+        p = subprocess.Popen(
+            child, env=env,
+            stdout=subprocess.DEVNULL, stderr=subprocess.STDOUT,
+        )
+        tmp_files.append(tmp)
+        print(f"[GPU {gpu}] → {protein} (pending={len(pending)})")
+        return (protein, p, tmp, t0)
+
+    # Seed the pool.
+    for gpu in gpus:
+        if not pending:
+            break
+        active[gpu] = launch(gpu, pending.pop(0))
+
+    # Poll and refill.
+    while any(v is not None for v in active.values()):
+        made_progress = False
+        for gpu, slot in active.items():
+            if slot is None:
+                continue
+            protein, proc, tmp, t0 = slot
+            if proc.poll() is None:
+                continue  # still running
+            dt = time.time() - t0
+            rc = proc.returncode
+            if rc == 0:
+                print(f"[GPU {gpu}] ✓ {protein} ({dt:.1f}s)")
+                done += 1
+            else:
+                failed.append(protein)
+                print(f"[GPU {gpu}] ✗ {protein} exit={rc} ({dt:.1f}s)")
+            active[gpu] = None
+            made_progress = True
+            if pending:
+                active[gpu] = launch(gpu, pending.pop(0))
+        if not made_progress:
+            time.sleep(0.5)
+
+    total = time.time() - total_start
+    print(f"\nAll workers done: {done} OK, {len(failed)} failed "
+          f"({total:.1f}s wall = {total/60:.1f} min)")
+    if failed:
+        print(f"  failed proteins: {failed}")
+
+    # Merge per-protein tmp files into args.out.
+    rot_desc = (
+        f"random n={args.n_rotations} (seed={args.seed})"
+        if args.euler_deg is None else f"euler deg={args.euler_deg}"
+    )
+    root_attrs = dict(
+        rotation_desc=rot_desc,
+        ntop=int(args.ntop),
+        spacing=float(args.spacing),
+    )
+    if args.out.exists():
+        args.out.unlink()
+    n_written = _merge_h5(tmp_files, args.out, root_attrs)
+    for tmp in tmp_files:
+        if tmp.exists():
+            tmp.unlink()
+    print(f"merged {n_written} protein groups → {args.out}")
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__)
     ap.add_argument("--h5", type=Path, default=DEFAULT_H5,
@@ -250,7 +407,17 @@ def main() -> None:
                          "checkpoint; default = Julia LUT defaults")
     ap.add_argument("--no-rmsd", action="store_true",
                     help="skip RMSD-to-near-native computation")
+    ap.add_argument("--gpus", default=None,
+                    help="comma-separated GPU indices to parallelise across "
+                         "(e.g. '0,1,2,3'). If set, dispatches one "
+                         "subprocess per GPU with CUDA_VISIBLE_DEVICES "
+                         "isolation, then merges per-GPU h5 outputs. "
+                         "Overrides --device.")
     args = ap.parse_args()
+
+    if args.gpus:
+        dispatch_multi_gpu(args)
+        return
 
     if not args.h5.exists():
         raise SystemExit(f"input h5 not found: {args.h5}")
