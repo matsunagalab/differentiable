@@ -637,16 +637,56 @@ training distribution** plus **DockQ v2 as the ranking signal**.
 
 **Step 1 — build FFT decoy dataset with DockQ labels**:
 
+Two filter modes, chosen with `--filter-mode`:
+
+- `top_k` (default): global top-N by score across every
+  (rotation × translation) candidate. Fast, but biased toward what
+  the current scorer considers best — with untrained parameters
+  `n_positive` is often 0 (all decoys are non-native), and
+  self-consistent training stalls because the rank loss has no
+  positives to rank toward.
+- `stratified`: mix of three sources that **guarantees positives
+  plus broad score coverage**:
+  1. **Near-native cone** (`--n-anchor`, default 200): for each of
+     `n_anchor` rotations sampled within `--cone-deg` (default 12°)
+     of the Kabsch-optimal rotation, place the ligand at the
+     geometrically-matched translation. No FFT for this source —
+     guarantees every anchor has DockQ ≥ 0.23 regardless of scorer
+     state. Scores are recovered via `docking_score_elec`.
+  2. **Hard negatives** (`--n-hard`, default 1000): top-K by score
+     from uniform random rotations — the "FFT top-1 is non-native"
+     failure mode captured explicitly in the training set.
+  3. **Controls** (`--n-control`, default 200): tail of the same
+     random source — lower-ranked but still explored poses, to
+     prevent mode collapse around the hard-negative region.
+
 ```bash
-# Full BM4 on 4 GPUs, 4096 random rotations, top-2000 decoys per complex
+# Recommended: stratified with near-native anchors
 uv run python scripts/build_fft_decoys.py \
-    --gpus 0,1,2,3 --n-rotations 4096 --ntop 2000
+    --gpus 0,1,2,3 --filter-mode stratified \
+    --n-anchor 200 --n-hard 1000 --n-control 200
 
 # Subset for quick iteration
 CUDA_VISIBLE_DEVICES=0 uv run python scripts/build_fft_decoys.py \
-    --proteins 1PPE 2SIC 1R0R --n-rotations 2048 --ntop 1000 \
+    --proteins 1PPE 2SIC 1R0R --filter-mode stratified \
     --out out/fft_decoys_smoke.h5
+
+# Legacy top-K (= ZDOCK-style pure score ranking, no positive guarantee)
+uv run python scripts/build_fft_decoys.py --gpus 0,1,2,3 \
+    --n-rotations 4096 --ntop 2000    # filter-mode defaults to top_k
 ```
+
+Typical stratified smoke on a trypsin–BPTI complex (1PPE):
+
+```
+anchors  (n=200)   score [-4.6e+02, -3.4e+02]   DockQ median 0.89   positives 200
+hard-neg (n=1000)  score [+6.3e+02, +7.3e+02]   DockQ median 0.02   positives 0
+controls (n=200)   score [+6.2e+02, +6.3e+02]   DockQ median 0.02   positives 0
+```
+
+Note how the untrained scorer rates native-like poses ~1000 units
+LOWER than alternative sites — exactly the failure the rank + margin
+losses are designed to correct.
 
 Output schema per protein:
 `lig_xyz (F, N_lig, 3)`, `score (F,)`, `rotation_quat (F, 4)`,

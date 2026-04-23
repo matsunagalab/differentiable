@@ -78,6 +78,114 @@ def scipy_rotations_to_quaternions(
     return q_t
 
 
+def kabsch_quaternion(
+    ref_xyz: torch.Tensor,              # (N, 3)
+    target_xyz: torch.Tensor,           # (N, 3)
+    *,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype = torch.float64,
+) -> torch.Tensor:
+    """Return the quaternion that best rotates `ref_xyz` onto
+    `target_xyz` in the least-squares (Kabsch) sense, expressed in
+    the `geom.rotate` convention.
+
+    Both point sets are first decentered (COM subtracted) so the
+    Kabsch alignment is purely rotational. Equivalent to running
+    `scipy.spatial.transform.Rotation.align_vectors(target, ref)` on
+    the centered sets and then converting via
+    `scipy_rotations_to_quaternions(as_inverse=True)`.
+
+    Returns a `(4,)` quaternion. Caller still needs to separately
+    supply the translation `target_COM - ref_COM` to produce the
+    full pose.
+    """
+    if ref_xyz.shape != target_xyz.shape:
+        raise ValueError(
+            f"ref and target must share shape; got {tuple(ref_xyz.shape)} "
+            f"vs {tuple(target_xyz.shape)}"
+        )
+    if ref_xyz.ndim != 2 or ref_xyz.shape[1] != 3:
+        raise ValueError(f"inputs must be (N, 3), got {tuple(ref_xyz.shape)}")
+
+    ref_np = ref_xyz.detach().cpu().numpy().astype(np.float64)
+    target_np = target_xyz.detach().cpu().numpy().astype(np.float64)
+    ref_c = ref_np - ref_np.mean(axis=0)
+    target_c = target_np - target_np.mean(axis=0)
+
+    # Rotation that takes ref onto target (i.e., R · ref ≈ target).
+    r_align, _ = _ScipyRotation.align_vectors(target_c, ref_c)
+    q = scipy_rotations_to_quaternions(
+        r_align, as_inverse=True, device=device, dtype=dtype,
+    )
+    return q.squeeze(0)  # (4,)
+
+
+def rotation_cone(
+    q_center: torch.Tensor,             # (4,) in geom.rotate convention
+    n: int,
+    *,
+    cone_deg: float = 15.0,
+    seed: int = 0,
+    device: torch.device | str | None = None,
+    dtype: torch.dtype | None = None,
+) -> torch.Tensor:
+    """Return `(n, 4)` quaternions sampled within an angular cone of
+    radius `cone_deg` degrees around `q_center`.
+
+    Sampling scheme: for each sample, draw a uniform axis on S² and an
+    angle θ ~ Uniform(0, cone_deg). Compose δ(axis, θ) · q_center.
+
+    Angle is uniform in [0, cone_deg], which overweights the shell
+    near cone_deg slightly relative to a uniform volume sampling — but
+    for our purpose (guarantee coverage near q_center, including the
+    exact pose at θ = 0) this is fine and predictable.
+    """
+    if q_center.shape != (4,):
+        raise ValueError(f"q_center must be (4,), got {tuple(q_center.shape)}")
+    if cone_deg < 0 or cone_deg > 180:
+        raise ValueError(f"cone_deg must be in [0, 180], got {cone_deg}")
+
+    if device is None:
+        device = q_center.device
+    if dtype is None:
+        dtype = q_center.dtype
+
+    rng = np.random.default_rng(seed)
+
+    # Random axis uniformly on S² via Gaussian normalization.
+    v = rng.standard_normal((n, 3))
+    v = v / np.linalg.norm(v, axis=1, keepdims=True)
+
+    # Angle uniform in [0, cone_rad]. θ=0 at i=0 so the exact center
+    # is guaranteed to appear — useful for sanity checks.
+    cone_rad = math.radians(cone_deg)
+    theta = rng.uniform(0.0, cone_rad, size=n)
+    theta[0] = 0.0  # first sample is exact center
+
+    half = theta / 2.0
+    delta_xyz = v * np.sin(half)[:, None]                # (n, 3)
+    delta_w = np.cos(half)                                # (n,)
+    delta = np.concatenate([delta_xyz, delta_w[:, None]], axis=1)  # (n, 4)
+
+    # Hamilton quat mul: q = delta · q_center   (both (x, y, z, w)).
+    def quat_mul(a: np.ndarray, b: np.ndarray) -> np.ndarray:
+        ax, ay, az, aw = a[..., 0], a[..., 1], a[..., 2], a[..., 3]
+        bx, by, bz, bw = b[..., 0], b[..., 1], b[..., 2], b[..., 3]
+        return np.stack([
+            aw * bx + ax * bw + ay * bz - az * by,
+            aw * by - ax * bz + ay * bw + az * bx,
+            aw * bz + ax * by - ay * bx + az * bw,
+            aw * bw - ax * bx - ay * by - az * bz,
+        ], axis=-1)
+
+    q_c_np = q_center.detach().cpu().numpy().astype(np.float64)
+    q_out = quat_mul(delta, q_c_np)
+    q_out = q_out / np.linalg.norm(q_out, axis=1, keepdims=True)
+
+    q_t = torch.as_tensor(q_out, dtype=dtype)
+    return q_t.to(device)
+
+
 def euler_quaternions(
     deg: float = 15.0,
     *,
