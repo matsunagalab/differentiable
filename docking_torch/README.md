@@ -625,6 +625,78 @@ Output layout (per protein group):
 RMSD is available. Root attrs capture the rotation grid and scorer
 params so downstream consumers know what produced the file.
 
+### (2d) DockQ-driven self-consistent training — `06_train_dockq_fft.py`
+
+A separate training path that lives **alongside** the canonical BM4
+workflow (`02_train.py` / `03_evaluate.py` are preserved unchanged).
+Motivation: the FFT search can find non-native poses that outscore
+the near-native region, and those adversarial poses are absent from
+the ZDOCK-curated BM4 decoy set — so training on BM4 alone leaves the
+failure unfixed. This path uses **FFT-generated decoys as the
+training distribution** plus **DockQ v2 as the ranking signal**.
+
+**Step 1 — build FFT decoy dataset with DockQ labels**:
+
+```bash
+# Full BM4 on 4 GPUs, 4096 random rotations, top-2000 decoys per complex
+uv run python scripts/build_fft_decoys.py \
+    --gpus 0,1,2,3 --n-rotations 4096 --ntop 2000
+
+# Subset for quick iteration
+CUDA_VISIBLE_DEVICES=0 uv run python scripts/build_fft_decoys.py \
+    --proteins 1PPE 2SIC 1R0R --n-rotations 2048 --ntop 1000 \
+    --out out/fft_decoys_smoke.h5
+```
+
+Output schema per protein:
+`lig_xyz (F, N_lig, 3)`, `score (F,)`, `rotation_quat (F, 4)`,
+`translation (F, 3)`, plus **`fnat`**, **`i_rmsd`**, **`l_rmsd`**,
+**`dockq`** — atom-level DockQ v2 (Mirabello & Wallner 2024) computed
+against a pseudo-native reference (the BM4 decoy with smallest
+stored RMSD, typically ~0.5–2 Å from crystal).
+
+**Step 2 — train, comparing loss functions**:
+
+```bash
+# DockQ listwise ranking loss (softmax(dockq/T), T=0.2)
+uv run python examples/06_train_dockq_fft.py \
+    --decoys out/fft_decoys_dockq.h5 --loss dockq_rank
+
+# Hard-negative margin loss: positives (DockQ ≥ 0.23 CAPRI-acceptable)
+# must outscore every negative by at least the margin
+uv run python examples/06_train_dockq_fft.py \
+    --decoys out/fft_decoys_dockq.h5 --loss dockq_margin \
+    --margin-positive-threshold 0.23 --margin 1.0
+
+# For head-to-head comparisons, also run the existing losses on the
+# same FFT-decoy data:
+uv run python examples/06_train_dockq_fft.py --loss split_mse   # MSE baseline
+uv run python examples/06_train_dockq_fft.py --loss rank        # ListNet on RMSD
+```
+
+The loss implementations live in `src/zdock/train.py`:
+
+- `loss_listnet_dockq(scores, dockq, temperature)` — ListNet on DockQ.
+- `loss_margin_hard_negatives(scores, dockq, positive_threshold, margin)`
+  — hinge penalty whenever a DockQ-negative pose outscores `min(DockQ-positive scores)` by less than `margin`. Directly targets the "top scorer is non-native" failure mode.
+
+Both are pure single-term losses so runs with `--loss dockq_rank` and
+`--loss dockq_margin` are directly comparable. Combine them by
+training sequentially (fine-tune margin on a rank-trained checkpoint)
+or by extending the training loop externally.
+
+**Step 3 — evaluate on the held-out test split**:
+
+```bash
+uv run python examples/07_evaluate_dockq.py \
+    --params out/trained_params_dockq_fft.pt --split test
+```
+
+Reports top-1 DockQ before vs after, best-DockQ-in-top-K, CAPRI tier
+transitions per protein, and success rates at Acceptable/Medium/High
+thresholds. Contrast with `03_evaluate.py` (unchanged — reports
+Hit-in-top-K on the BM4 decoy set).
+
 ### (3) Evaluate the held-out test split — `examples/03_evaluate.py`
 
 Reads the ckpt from (2), pulls out `test_proteins` (and the `h5`,

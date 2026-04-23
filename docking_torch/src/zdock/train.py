@@ -46,6 +46,8 @@ class ProteinInputs:
     lig_charge_id: torch.Tensor
     hit_mask: torch.Tensor             # (F,) bool: True for Positive poses
     rmsd: torch.Tensor | None = None   # (F,) optional raw RMSD (Å) to re-threshold later
+    dockq: torch.Tensor | None = None  # (F,) optional DockQ [0, 1] per pose
+                                       # — required by loss="dockq_rank"
 
     def call(
         self,
@@ -130,6 +132,75 @@ def loss_listnet(
     return -(target * log_pred).sum()
 
 
+def loss_listnet_dockq(
+    scores: torch.Tensor,
+    dockq: torch.Tensor,
+    *,
+    temperature: float = 0.2,
+) -> torch.Tensor:
+    """ListNet listwise cross-entropy with DockQ as the relevance signal.
+
+        target_i = softmax(dockq / T)_i   # HIGH dockq -> high target prob
+        pred_i   = softmax(scores)_i
+        loss     = -sum_i target_i * log pred_i
+
+    Sign is flipped relative to `loss_listnet` (RMSD is lower-is-better;
+    DockQ is higher-is-better). Default ``temperature=0.2`` puts most of
+    the target mass on the top-DockQ decoys while still carrying
+    gradient through the Medium/High tier — DockQ lives in [0, 1] so
+    the temperature scale is dimensionless and much smaller than the
+    RMSD-temperature default.
+
+    Returns a scalar loss. Input poses with all-zero DockQ (no positive
+    examples) give a uniform target ⇒ the loss equals
+    ``log F - mean(log softmax(scores))`` which still has gradient.
+    """
+    if dockq.numel() == 0:
+        return torch.zeros((), device=scores.device, dtype=scores.dtype)
+    target = torch.softmax(dockq / temperature, dim=0)
+    log_pred = torch.log_softmax(scores, dim=0)
+    return -(target * log_pred).sum()
+
+
+def loss_margin_hard_negatives(
+    scores: torch.Tensor,
+    dockq: torch.Tensor,
+    *,
+    positive_threshold: float = 0.23,
+    margin: float = 1.0,
+) -> torch.Tensor:
+    """Hinge-style penalty on high-scoring non-positives.
+
+    Define positives as poses with DockQ >= ``positive_threshold``
+    (CAPRI "acceptable" by default). For every negative pose whose
+    score exceeds ``min(positive scores) - margin``, add a hinge
+    penalty:
+
+        L = mean_neg( max(0, margin + score_neg - min_pos_score) )
+
+    Intuition: the scorer must rank the WORST positive above every
+    negative by at least ``margin``. Targets the "FFT finds a
+    high-scoring non-native" failure mode directly.
+
+    Edge cases:
+    - No positives in the batch → return zero (no signal to give).
+    - No negatives → return zero.
+    """
+    pos_mask = dockq >= positive_threshold
+    neg_mask = ~pos_mask
+    if not pos_mask.any() or not neg_mask.any():
+        # Graph-connected zero: keeps autograd happy in a training
+        # loop that mixes proteins with and without positive examples.
+        # A protein with no positives contributes no margin signal but
+        # also doesn't block backward().
+        return (scores * 0.0).sum()
+    pos_scores = scores[pos_mask]
+    neg_scores = scores[neg_mask]
+    min_pos = pos_scores.min()
+    hinge = torch.clamp(margin + neg_scores - min_pos, min=0.0)
+    return hinge.mean()
+
+
 def total_loss(
     proteins: Iterable[ProteinInputs],
     alpha: torch.Tensor,
@@ -155,7 +226,7 @@ def total_loss(
     return torch.stack(parts).sum()
 
 
-_VALID_LOSSES = ("split_mse", "rank")
+_VALID_LOSSES = ("split_mse", "rank", "dockq_rank", "dockq_margin")
 
 
 def train(
@@ -170,17 +241,36 @@ def train(
     frame_chunk_size: int | None = None,
     loss: str = "split_mse",
     listnet_temperature: float = 5.0,
+    dockq_temperature: float = 0.2,
+    margin_positive_threshold: float = 0.23,
+    margin: float = 1.0,
 ) -> dict:
     """Run the full Adam optimization and return the trained parameters
     plus a loss history.
 
-    `loss` selects the per-protein objective:
+    `loss` selects the per-protein objective (each is a *pure* term —
+    they are exposed separately so experiments can compare them
+    head-to-head; for a combined-term run, call `train()` twice or
+    compose externally):
+
       - "split_mse" (default): the Julia `loss_b2_fixed` — Hit poses
-        pulled to max(initial_scores), Miss poses to min. Targets are
-        frozen at pre-training values.
+        pulled to max(initial_scores), Miss poses to min. Targets
+        are frozen at pre-training values.
       - "rank": ListNet on RMSD — `loss_listnet(scores, rmsd,
-        temperature=listnet_temperature)`. Requires every protein to
-        carry `rmsd`; raises ValueError otherwise.
+        temperature=listnet_temperature)`. Requires every protein
+        to carry `rmsd`.
+      - "dockq_rank": ListNet on DockQ — `loss_listnet_dockq(scores,
+        dockq, temperature=dockq_temperature)`. Requires every
+        protein to carry `dockq`. Higher DockQ → higher target prob,
+        so the sign is flipped relative to "rank".
+      - "dockq_margin": hard-negative hinge on DockQ —
+        `loss_margin_hard_negatives(scores, dockq,
+        positive_threshold=margin_positive_threshold,
+        margin=margin)`. Directly penalises negatives (DockQ below
+        threshold) that outscore the weakest positive; the
+        pin-point antidote to the observed "FFT top-1 is
+        non-native" failure mode. Requires every protein to carry
+        `dockq`.
 
     The per-epoch loss is the sum of per-protein losses. We compute + run
     backward *per protein* so only one protein's autograd graph lives at
@@ -212,6 +302,13 @@ def train(
                 raise ValueError(
                     f"loss='rank' requires rmsd on every protein, but "
                     f"proteins[{i}] has rmsd=None"
+                )
+    if loss in ("dockq_rank", "dockq_margin"):
+        for i, p in enumerate(proteins):
+            if p.dockq is None:
+                raise ValueError(
+                    f"loss={loss!r} requires dockq on every protein, but "
+                    f"proteins[{i}] has dockq=None"
                 )
     # Initial parameters — same as Julia `train_param-apart.ipynb` cell
     # 27-28 defaults.
@@ -251,7 +348,17 @@ def train(
                 lp = loss_listnet(
                     scores, p.rmsd, temperature=listnet_temperature,
                 )
-            else:
+            elif loss == "dockq_rank":
+                lp = loss_listnet_dockq(
+                    scores, p.dockq, temperature=dockq_temperature,
+                )
+            elif loss == "dockq_margin":
+                lp = loss_margin_hard_negatives(
+                    scores, p.dockq,
+                    positive_threshold=margin_positive_threshold,
+                    margin=margin,
+                )
+            else:  # split_mse
                 ht, mt = tgt
                 lp = loss_b2_fixed(scores, p.hit_mask, ht, mt)
             lp.backward()
