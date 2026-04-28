@@ -87,6 +87,95 @@ def _grouped_spread_nearest_add(
     return grid_batch
 
 
+def _grouped_spread_trilinear_add(
+    grid_batch: torch.Tensor,         # (G, nx, ny, nz)
+    xyz: torch.Tensor,                # (N, 3) — may require_grad
+    group: torch.Tensor,              # (N,) int in [0, G)
+    weights: torch.Tensor,            # (N,)
+    x_grid: torch.Tensor,
+    y_grid: torch.Tensor,
+    z_grid: torch.Tensor,
+) -> torch.Tensor:
+    """Trilinear (B-spline order 2) scatter — SPME-style smooth
+    particle-to-mesh spreading. Each atom is distributed across the
+    8 cells of its containing cube with weights that are smooth
+    functions of the atom's fractional position.
+
+    Gradient flows through the corner weights back to ``xyz``:
+    ``dx = ix_f - floor(ix_f)`` is continuous in ``xyz`` even though
+    ``floor`` is not. Weight sum = 1 is preserved, so the integer
+    part being non-differentiable doesn't break the gradient of the
+    aggregate score.
+
+    Atoms within one cell of the grid boundary (i.e., any of the 8
+    corners would fall outside the grid) are dropped — this is the
+    "hard cutoff" at the grid edge. For docking this is fine since
+    ligand atoms that escape the receptor-centered grid contribute
+    nothing physically meaningful anyway.
+    """
+    G, nx, ny, nz = grid_batch.shape
+    dtype = grid_batch.dtype
+    V = nx * ny * nz
+
+    # Uniform spacing per axis — this is how `generate_grid` builds them.
+    spacing_x = x_grid[1] - x_grid[0]
+    spacing_y = y_grid[1] - y_grid[0]
+    spacing_z = z_grid[1] - z_grid[0]
+
+    # Float cell coordinates (continuous, diff wrt xyz).
+    ix_f = (xyz[:, 0] - x_grid[0]) / spacing_x
+    iy_f = (xyz[:, 1] - y_grid[0]) / spacing_y
+    iz_f = (xyz[:, 2] - z_grid[0]) / spacing_z
+
+    # Integer part (non-diff), fractional part (diff).
+    ix0 = ix_f.detach().floor().long()
+    iy0 = iy_f.detach().floor().long()
+    iz0 = iz_f.detach().floor().long()
+    dx = ix_f - ix0.to(dtype)          # ∈ [0, 1), diff wrt xyz
+    dy = iy_f - iy0.to(dtype)
+    dz = iz_f - iz0.to(dtype)
+
+    # In-bounds: need all 8 neighbors (ix0..ix0+1 × ...) within grid.
+    in_b = (
+        (ix0 >= 0) & (ix0 + 1 < nx)
+        & (iy0 >= 0) & (iy0 + 1 < ny)
+        & (iz0 >= 0) & (iz0 + 1 < nz)
+        & (group >= 0) & (group < G)
+    )
+    valid = in_b.nonzero(as_tuple=True)[0]
+    if valid.numel() == 0:
+        return grid_batch
+
+    ix0v = ix0[valid]
+    iy0v = iy0[valid]
+    iz0v = iz0[valid]
+    dxv = dx[valid]
+    dyv = dy[valid]
+    dzv = dz[valid]
+    gv = group[valid]
+    wv = weights[valid]
+
+    # 8 corners: (ox, oy, oz) ∈ {0, 1}³. Loop is cheap (8 iterations)
+    # and keeps memory bounded — fused corners would use 8× the atom
+    # tensors simultaneously.
+    for ox in (0, 1):
+        wx = dxv if ox == 1 else (1.0 - dxv)
+        for oy in (0, 1):
+            wy = dyv if oy == 1 else (1.0 - dyv)
+            for oz in (0, 1):
+                wz = dzv if oz == 1 else (1.0 - dzv)
+                corner_w = wx * wy * wz           # (N_valid,)
+                contribs = wv * corner_w
+                flat = (
+                    gv * V
+                    + (ix0v + ox) * (ny * nz)
+                    + (iy0v + oy) * nz
+                    + (iz0v + oz)
+                )
+                grid_batch.view(-1).scatter_add_(0, flat, contribs)
+    return grid_batch
+
+
 def _grouped_spread_neighbors_add(
     grid_batch: torch.Tensor,
     xyz: torch.Tensor,
@@ -231,6 +320,7 @@ def _score_ligand_chunk(
     z_grid: torch.Tensor,
     surface_threshold: float,
     elec_mode: ElecMode,
+    scatter_mode: str = "nearest",
 ) -> torch.Tensor:
     """Per-frame total scores for a single ligand frame-chunk, re-using
     precomputed receptor grids.
@@ -318,12 +408,23 @@ def _score_ligand_chunk(
 
     L_count = torch.zeros((F * 12, nx, ny, nz), device=device, dtype=dtype)
     group_f12 = frame_idx_per_atom * 12 + lig_group_iface_flat
-    _grouped_spread_nearest_add(
-        L_count, lxyz_flat, group_f12,
-        torch.ones(lxyz_flat.shape[0], device=device, dtype=dtype),
-        x_grid, y_grid, z_grid,
-    )
-    L = (L_count.view(F, 12, nx, ny, nz) > 0).to(dtype)
+    if scatter_mode == "trilinear":
+        _grouped_spread_trilinear_add(
+            L_count, lxyz_flat, group_f12,
+            torch.ones(lxyz_flat.shape[0], device=device, dtype=dtype),
+            x_grid, y_grid, z_grid,
+        )
+        # `clamp(max=1)` replaces the non-diff `(count > 0)` indicator
+        # with a differentiable "is any atom nearby?" surrogate. Gradient
+        # saturates at 1 per cell which is fine for docking ranking.
+        L = L_count.view(F, 12, nx, ny, nz).clamp(max=1.0)
+    else:
+        _grouped_spread_nearest_add(
+            L_count, lxyz_flat, group_f12,
+            torch.ones(lxyz_flat.shape[0], device=device, dtype=dtype),
+            x_grid, y_grid, z_grid,
+        )
+        L = (L_count.view(F, 12, nx, ny, nz) > 0).to(dtype)
     T = torch.einsum("fiv,jv->fij", L.reshape(F, 12, V), H.reshape(12, V))
     score_iface = (iface_matrix.unsqueeze(0) * T).reshape(F, -1).sum(-1)
 
@@ -331,13 +432,17 @@ def _score_ligand_chunk(
         V_rec = V_rec_or_U
         lig_partial_q = partial_charge_per_atom(lig_charge_id, charge_score)
         lig_partial_q_flat = lig_partial_q.unsqueeze(0).expand(F, -1).reshape(-1)
-        Q_L_flat = torch.zeros(F * nx * ny * nz, device=device, dtype=dtype)
-        _grouped_spread_nearest_add(
-            Q_L_flat.view(F, nx, ny, nz),
-            lxyz_flat, frame_idx_per_atom, lig_partial_q_flat,
-            x_grid, y_grid, z_grid,
-        )
-        Q_L = Q_L_flat.view(F, nx, ny, nz)
+        Q_L = torch.zeros((F, nx, ny, nz), device=device, dtype=dtype)
+        if scatter_mode == "trilinear":
+            _grouped_spread_trilinear_add(
+                Q_L, lxyz_flat, frame_idx_per_atom, lig_partial_q_flat,
+                x_grid, y_grid, z_grid,
+            )
+        else:
+            _grouped_spread_nearest_add(
+                Q_L, lxyz_flat, frame_idx_per_atom, lig_partial_q_flat,
+                x_grid, y_grid, z_grid,
+            )
         score_elec = (V_rec.unsqueeze(0) * Q_L).reshape(F, -1).sum(-1)
     else:  # elec_mode == "legacy"
         U = V_rec_or_U
@@ -381,6 +486,7 @@ def docking_score_elec(
     surface_threshold: float = 1.0,
     elec_mode: ElecMode = "coulomb",
     frame_chunk_size: int | None = None,
+    scatter_mode: str = "nearest",
 ) -> torch.Tensor:
     """Return a (F,) tensor of docking scores.
 
@@ -403,6 +509,19 @@ def docking_score_elec(
     required. Peak VRAM then scales with F_chunk instead of F, at the
     cost of one extra forward per chunk during backward. `None` (default)
     or `<= 0` disables chunking (original behaviour).
+
+    `scatter_mode`: controls how ligand atoms are distributed onto the
+    grid.
+      - ``"nearest"`` (default) — each atom assigned to a single cell
+        (integer index, non-differentiable wrt ligand position but
+        matches the ZDOCK / Julia reference convention).
+      - ``"trilinear"`` — each atom spread across 8 surrounding cells
+        via SPME-style trilinear (B-spline order 2) weights.
+        Differentiable wrt ligand position so gradients can flow back
+        to ``lig_xyz`` for pose refinement. Score values agree with
+        nearest mode to within a few percent on typical complexes.
+        Only the IFACE and ELEC ligand-side scatters switch; SC uses
+        a separate neighbor-rcut path that remains nearest.
     """
     device = rec_xyz.device
     dtype = rec_xyz.dtype
@@ -501,6 +620,7 @@ def docking_score_elec(
         lig_atomtype_id=lig_atomtype_id, lig_charge_id=lig_charge_id,
         x_grid=x_grid, y_grid=y_grid, z_grid=z_grid,
         surface_threshold=surface_threshold, elec_mode=elec_mode,
+        scatter_mode=scatter_mode,
     )
     use_chunks = (
         frame_chunk_size is not None

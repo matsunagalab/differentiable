@@ -42,6 +42,7 @@ from .score import (
     _assign_sc_minus,
     _grouped_spread_nearest_add,
     _grouped_spread_neighbors_add,
+    docking_score_elec,
 )
 from .spread import spread_neighbors_coulomb
 
@@ -762,6 +763,101 @@ def docking_search(
         quat_indices=buf_quat,
         translations=torch.stack([tx_s, ty_s, tz_s], dim=-1),
     )
+
+
+# ---------------------------------------------------------------------------
+# Gradient-based pose refinement
+# ---------------------------------------------------------------------------
+
+
+def refine_poses_gradient(
+    rec_xyz: torch.Tensor, rec_radius: torch.Tensor, rec_sasa: torch.Tensor,
+    rec_atomtype_id: torch.Tensor, rec_charge_id: torch.Tensor,
+    lig_xyz_ref: torch.Tensor, lig_radius: torch.Tensor, lig_sasa: torch.Tensor,
+    lig_atomtype_id: torch.Tensor, lig_charge_id: torch.Tensor,
+    q_init: torch.Tensor,                  # (B, 4) starting quaternions
+    t_init: torch.Tensor,                  # (B, 3) starting translations (Å)
+    *,
+    alpha: torch.Tensor,
+    iface_ij_flat: torch.Tensor,
+    beta: torch.Tensor,
+    charge_score_lut: torch.Tensor,
+    n_iter: int = 50,
+    lr_q: float = 0.02,
+    lr_t: float = 0.2,
+    spacing: float = 1.2,
+    scatter_mode: str = "trilinear",
+    frame_chunk_size: int | None = None,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Adam ascent on (q, t) maximizing ``docking_score_elec`` for a
+    batch of B starting poses.
+
+    Inputs are the same 10-field receptor/ligand bundle as
+    ``docking_search`` / ``docking_score_elec``, plus:
+
+        q_init : (B, 4)  starting quaternion per pose (same convention
+                         as ``geom.rotate`` / ``_rotate_batch``)
+        t_init : (B, 3)  starting cartesian translation (Å)
+
+    Returns ``(q_final, t_final, scores_final)`` each leading dim B.
+    Rotation is kept on the unit-quaternion manifold by renormalising
+    after every Adam step (simple but adequate for local refinement;
+    for principled SO(3) optimisation use a Lie-algebra step).
+
+    Refinement uses a single batched ``docking_score_elec`` call per
+    iteration, so cost is B-independent in the receptor-precompute
+    part and scales per-pose in the ligand-side scatter+IFACE+ELEC.
+    """
+    if q_init.shape[-1] != 4 or q_init.ndim != 2:
+        raise ValueError(f"q_init must be (B, 4), got {tuple(q_init.shape)}")
+    if t_init.shape[-1] != 3 or t_init.ndim != 2:
+        raise ValueError(f"t_init must be (B, 3), got {tuple(t_init.shape)}")
+    if q_init.shape[0] != t_init.shape[0]:
+        raise ValueError(
+            f"q_init and t_init must share batch size; got "
+            f"{q_init.shape[0]} vs {t_init.shape[0]}"
+        )
+
+    q = q_init.detach().clone().requires_grad_(True)
+    t = t_init.detach().clone().requires_grad_(True)
+
+    opt = torch.optim.Adam([
+        {"params": [q], "lr": lr_q},
+        {"params": [t], "lr": lr_t},
+    ])
+
+    for _step in range(n_iter):
+        opt.zero_grad()
+        q_norm = q / q.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        lig_rot = _rotate_batch(lig_xyz_ref, q_norm)        # (B, N_lig, 3)
+        pose = lig_rot + t.unsqueeze(-2)                    # (B, N_lig, 3)
+        scores = docking_score_elec(
+            rec_xyz, rec_radius, rec_sasa, rec_atomtype_id, rec_charge_id,
+            pose, lig_radius, lig_sasa, lig_atomtype_id, lig_charge_id,
+            alpha=alpha, iface_ij_flat=iface_ij_flat, beta=beta,
+            charge_score=charge_score_lut,
+            lig_xyz_for_grid=lig_xyz_ref, spacing=spacing,
+            scatter_mode=scatter_mode,
+            frame_chunk_size=frame_chunk_size,
+        )
+        # Maximise scores → minimise −sum(scores).
+        (-scores.sum()).backward()
+        opt.step()
+
+    with torch.no_grad():
+        q_final = q / q.norm(dim=-1, keepdim=True).clamp(min=1e-8)
+        t_final = t.detach().clone()
+        lig_rot = _rotate_batch(lig_xyz_ref, q_final)
+        pose = lig_rot + t_final.unsqueeze(-2)
+        scores_final = docking_score_elec(
+            rec_xyz, rec_radius, rec_sasa, rec_atomtype_id, rec_charge_id,
+            pose, lig_radius, lig_sasa, lig_atomtype_id, lig_charge_id,
+            alpha=alpha, iface_ij_flat=iface_ij_flat, beta=beta,
+            charge_score=charge_score_lut,
+            lig_xyz_for_grid=lig_xyz_ref, spacing=spacing,
+        )
+
+    return q_final.detach(), t_final, scores_final
 
 
 def docking_search_sc(

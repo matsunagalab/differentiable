@@ -80,6 +80,7 @@ def load_fft_decoy_h5(
     device: torch.device,
     dtype: torch.dtype,
     hit_threshold: float = 0.23,
+    skip_anchors: bool = False,
 ) -> list[ProteinInputs]:
     """Load each protein's FFT-generated decoys as `ProteinInputs`.
 
@@ -89,6 +90,13 @@ def load_fft_decoy_h5(
     ligand features from the BM4 dataset that was used to build the
     decoys, because the FFT-decoy file intentionally does not
     duplicate those static fields.
+
+    ``skip_anchors=True`` drops the first ``n_anchor`` poses of each
+    protein — the stratified-filter near-native anchors (positions
+    0..n_anchor-1). Used for val/test evaluation to avoid measuring
+    "anchor retrieval" instead of "native discovery." ``n_anchor`` is
+    read from the h5 root attrs (saved by the stratified build) and
+    defaults to 0 if absent.
     """
     # Receptor and ligand atom features are NOT in the FFT decoy h5
     # (kept compact). Pull them from bm4_full.h5 using the protein IDs.
@@ -103,6 +111,7 @@ def load_fft_decoy_h5(
 
     out: list[ProteinInputs] = []
     with h5py.File(path, "r") as f_fft, h5py.File(bm4_path, "r") as f_bm4:
+        n_anchor = int(f_fft.attrs.get("n_anchor", 0)) if skip_anchors else 0
         for name in protein_names:
             if name not in f_fft:
                 raise KeyError(f"{path}: no group for {name}")
@@ -123,6 +132,12 @@ def load_fft_decoy_h5(
             lig_xyz = T(g, "lig_xyz")            # (F, N_lig, 3)
             dockq = T(g, "dockq")                # (F,)
             l_rmsd = T(g, "l_rmsd")              # (F,)
+            if n_anchor > 0:
+                # Drop near-native anchors (positions 0..n_anchor-1)
+                # for honest val / test evaluation.
+                lig_xyz = lig_xyz[n_anchor:]
+                dockq = dockq[n_anchor:]
+                l_rmsd = l_rmsd[n_anchor:]
             hit_mask = (dockq >= hit_threshold)
 
             inputs = ProteinInputs(
@@ -257,9 +272,15 @@ def main() -> None:
         args.decoys, protein_names=train_names,
         device=device, dtype=dtype, hit_threshold=args.hit_threshold,
     )
+    # val evaluation INCLUDES anchor poses (tainted val).
+    # Switched back from anchor-free by explicit request — tainted
+    # val peaks at ~0.7 and correlates (partially) with the scorer's
+    # ability to rank hit-class poses highly on the training decoy
+    # distribution.
     val_proteins = load_fft_decoy_h5(
         args.decoys, protein_names=val_names,
         device=device, dtype=dtype, hit_threshold=args.hit_threshold,
+        skip_anchors=False,
     )
 
     frame_chunk_size = args.frame_chunk_size if args.frame_chunk_size > 0 else None

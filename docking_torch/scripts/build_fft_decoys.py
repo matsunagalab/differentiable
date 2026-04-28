@@ -170,6 +170,7 @@ def run_one_protein(
     cone_deg: float = 12.0,
     n_hard: int = 1000,
     n_control: int = 200,
+    n_hard_rot: int | None = None,
     seed: int = 0,
 ) -> dict | None:
     g = h5_in[protein_id]
@@ -265,11 +266,12 @@ def run_one_protein(
 
         # Source 2 + 3 — uniform random rotations; oversample and
         # partition into top-n_hard (hard negatives) + next-n_control
-        # (background / lower-ranked controls).
+        # (background / lower-ranked controls). The rotation pool size
+        # controls the effective angular grid density: at 10000 it's
+        # ~8° nearest-neighbor, matching ZDOCK's 6° grid qualitatively.
+        pool_size = n_hard_rot if n_hard_rot is not None else (n_hard + n_control * 4)
         q_rand = random_quaternions(
-            n_hard + n_control * 4,  # oversample rotation count so the
-                                     # "control" selection draws from a
-                                     # genuinely wider rank range
+            pool_size,
             seed=seed + 1, device=device, dtype=dtype,
         )
         ntop_rand = n_hard + n_control
@@ -433,7 +435,10 @@ def dispatch_multi_gpu(args: argparse.Namespace) -> None:
         rotation_desc=rot_desc,
         ntop=int(args.ntop),
         spacing=float(args.spacing),
+        filter_mode=str(args.filter_mode),
     )
+    if args.filter_mode == "stratified":
+        root_attrs["n_anchor"] = int(args.n_anchor)
     if args.params_ckpt is not None:
         root_attrs["params_ckpt"] = str(args.params_ckpt)
     if args.out.exists():
@@ -493,6 +498,14 @@ def main() -> None:
     ap.add_argument("--n-control", type=int, default=200,
                     help="[stratified] additional lower-ranked poses "
                          "from the random source (default 200).")
+    ap.add_argument("--n-hard-rot", type=int, default=None,
+                    help="[stratified] size of the random-rotation pool "
+                         "for the hard-negative source. Defaults to "
+                         "n_hard + n_control*4. Raising this increases "
+                         "the rotation-grid density (closer to ZDOCK's "
+                         "6° grid at ~54000 rotations) — trades compute "
+                         "for coverage. ntop retained remains "
+                         "n_hard + n_control.")
     args = ap.parse_args()
 
     if not args.h5.exists():
@@ -536,6 +549,9 @@ def main() -> None:
         h5_out.attrs["spacing"] = float(args.spacing)
         h5_out.attrs["alpha"] = float(alpha.item())
         h5_out.attrs["beta"] = float(beta.item())
+        h5_out.attrs["filter_mode"] = str(args.filter_mode)
+        if args.filter_mode == "stratified":
+            h5_out.attrs["n_anchor"] = int(args.n_anchor)
         if args.params_ckpt is not None:
             h5_out.attrs["params_ckpt"] = str(args.params_ckpt)
 
@@ -555,6 +571,7 @@ def main() -> None:
                 filter_mode=args.filter_mode,
                 n_anchor=args.n_anchor, cone_deg=args.cone_deg,
                 n_hard=args.n_hard, n_control=args.n_control,
+                n_hard_rot=args.n_hard_rot,
                 seed=args.seed,
             )
             dt = time.time() - t0
